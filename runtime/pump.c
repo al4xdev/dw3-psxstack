@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "phase.h"
 #include "platform.h"
 #include "port_harness.h"
 #include "port_runtime.h"
@@ -44,6 +45,7 @@ static void port_pace(void);
 static void port_pause(void);
 
 void port_pump_init(void) {
+    port_phase_init();
     psyq_set_vsync_pre_hook(port_audio_frame); /* the SPU's samples of the frame, before the game's handler */
     psyq_set_vsync_hook(port_frame);
     if (port_watchdog_sec > 0) {
@@ -89,7 +91,10 @@ static void port_frame(void) {
     if (port_debug_active) {
         port_debug_frame(); /* the channel's requests and its deferred ops, between the script and the video */
     }
+    port_phase_begin(PORT_PHASE_PRESENT);
     port_video_frame();
+    port_phase_end();
+    port_framecsv_frame();
     if (port_max_frames > 0 && port_frames >= port_max_frames) {
         port_exit(0, "frame cap");
     }
@@ -134,6 +139,7 @@ long port_pace_get(void) {
  * exits). The channel's reset, asked for while paused, runs once the loop is left (port_debug_resumed): the longjmp
  * must not skip the audio's and the window's un-pause. */
 static void port_pause(void) {
+    port_phase_suspend();
     port_log("pause at frame %ld", port_frames);
     port_video_set_paused(1);
     port_audio_pause(1);
@@ -159,6 +165,7 @@ static void port_pause(void) {
     }
     port_audio_pause(0);
     port_video_set_paused(0);
+    port_phase_resume();
     pump_pace_restart = 1;
     port_log("resume at frame %ld", port_frames);
     if (port_debug_active) {
@@ -173,11 +180,13 @@ static void port_pace(void) {
     static long long start;
     static long long n;
     long long now, t, ns;
+    port_phase_frame_close();
     if (pump_pace_restart) {
         pump_pace_restart = 0;
         n = 0;
     }
     if (pump_pace <= 0) {
+        port_phase_resume();
         return;
     }
     now = port_clock_ns();
@@ -190,9 +199,11 @@ static void port_pace(void) {
     if (t > ns + 100000000LL) {
         start = now;
         n = 0;
+        port_phase_resume();
         return;
     }
     port_sleep_until_ns(start + ns);
+    port_phase_resume();
 }
 
 void port_wait(void) {
@@ -222,6 +233,8 @@ void port_exit(int status, const char *reason) {
     if (!exiting) {
         exiting = 1;
         port_framelog_close(status, reason);
+        port_framecsv_close();
+        port_phase_close();
         port_video_close();
         port_audio_close();
         port_spu_trace_close();

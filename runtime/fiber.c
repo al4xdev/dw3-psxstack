@@ -233,6 +233,21 @@ __asm__(".text\n"
         ".size port_fiber_swap_, .-port_fiber_swap_\n");
 #define FIBER_FRAME_WORDS 22 /* 176 bytes: x19-x28, x29, x30, d8-d15 */
 #define FIBER_AARCH64 1
+#elif defined(__arm__)
+__asm__(".text\n"
+        ".arm\n"
+        ".globl port_fiber_swap_\n"
+        ".type port_fiber_swap_, %function\n"
+        "port_fiber_swap_:\n"
+        "  push {r4-r11, r12, lr}\n"
+        "  vpush {d8-d15}\n"
+        "  str sp, [r0]\n"
+        "  mov sp, r1\n"
+        "  vpop {d8-d15}\n"
+        "  pop {r4-r11, r12, pc}\n"
+        ".size port_fiber_swap_, .-port_fiber_swap_\n");
+#define FIBER_FRAME_WORDS 26 /* 104 bytes: d8-d15 (16 words), r4-r11 (8 words), r12 (1 word), lr (1 word) */
+#define FIBER_ARM32 1
 #else
 #error "fibers: no stack switch for this architecture (runtime/fiber.c port_fiber_swap_)"
 #endif
@@ -308,6 +323,10 @@ static void fiber_prepare(PortFiber *f) {
 #ifdef FIBER_AARCH64
     w = (uintptr_t *)(top - FIBER_FRAME_WORDS * sizeof(uintptr_t));
     w[11] = (uintptr_t)fiber_trampoline; /* x30: the return address of the first switch */
+    f->sp = w;
+#elif defined(FIBER_ARM32)
+    w = (uintptr_t *)(top - FIBER_FRAME_WORDS * sizeof(uintptr_t));
+    w[25] = (uintptr_t)fiber_trampoline; /* pc: the return address of the first switch */
     f->sp = w;
 #else
     *(uintptr_t *)(top - FIBER_RET_BELOW_TOP) = (uintptr_t)fiber_trampoline;

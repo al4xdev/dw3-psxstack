@@ -524,6 +524,8 @@ static void __attribute__((noinline, noreturn)) state_call_on_stack(void (*fn)(v
     __asm__ volatile("mov %0, %%esp\n\txor %%ebp, %%ebp\n\tcall *%1\n\tud2" : : "r"(top), "r"(fn) : "memory");
 #elif defined(__aarch64__)
     __asm__ volatile("mov sp, %0\n\tmov x29, xzr\n\tblr %1\n\tbrk #0" : : "r"(top), "r"(fn) : "memory");
+#elif defined(__arm__)
+    __asm__ volatile("mov sp, %0\n\tmov r11, #0\n\tblx %1\n\tbkpt #0" : : "r"(top), "r"(fn) : "memory");
 #else
 #error "save states: no stack switch for this architecture (runtime/savestate.c state_call_on_stack)"
 #endif

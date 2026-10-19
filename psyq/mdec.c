@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "psyq_internal.h"
+#include "phase.h"
 
 /* ---- the bit stream (DecDCTvlc2) ---- */
 
@@ -159,6 +160,7 @@ int mdec_vlc_decode(const u8 *frame, u32 *out) {
     u16 *hw = (u16 *)(out + 1);
     int in_block = 0;
 
+    port_phase_begin(PORT_PHASE_MDEC);
     mdec_vlc_init();
     out[0] = (0x3800u << 16) | size;
     b.p = frame + 8;
@@ -206,6 +208,7 @@ int mdec_vlc_decode(const u8 *frame, u32 *out) {
             in_block = 0;
         }
     }
+    port_phase_end();
     return 0;
 }
 
@@ -402,6 +405,7 @@ u32 mdec_decode_out(u32 *dst, u32 words) {
     u8 *out = (u8 *)dst;
     u32 bytes = words * 4, done = 0;
 
+    port_phase_begin(PORT_PHASE_MDEC);
     while (done < bytes) {
         u32 n;
 
@@ -416,6 +420,7 @@ u32 mdec_decode_out(u32 *dst, u32 words) {
         mdec.mb_pos += n;
         done += n;
     }
+    port_phase_end();
     return done / 4;
 }
 

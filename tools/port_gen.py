@@ -683,8 +683,15 @@ def cmd_state(args):
             if s in data and t in "DdBbRrGgSsVv":
                 by_unit.setdefault(src, set()).add(s)
     cflags = [f for f in (args.cflags or "").split() if f]
-    m64 = probe_sizes(args.cc, ["-m64"], args.include, args.define, by_unit)
-    owner = m64 if cflags == ["-m64"] or not cflags else probe_sizes(args.cc, cflags, args.include, args.define, by_unit)
+    has_m64 = subprocess.run([args.cc, "-m64", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"],
+                             capture_output=True).returncode == 0
+    if has_m64:
+        m64 = probe_sizes(args.cc, ["-m64"], args.include, args.define, by_unit)
+    else:
+        m64 = None
+    owner = m64 if (cflags == ["-m64"] or not cflags) and m64 is not None else probe_sizes(args.cc, cflags, args.include, args.define, by_unit)
+    if m64 is None:
+        m64 = owner
     drows, bad = [], []
     for s in sorted(owner, key=lambda s: data[s][0]):
         addr, ps1 = data[s]

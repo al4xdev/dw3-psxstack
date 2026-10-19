@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "psyq_internal.h"
+#include "psxstack/phase.h"
 
 #ifndef PC_PORT
 #error "port/psyq is the host shim: compile it with -DPC_PORT"
@@ -759,7 +760,7 @@ static int gpu_decode_row(u16 *out, const Mode *m, const u16 *row, int u, int n)
     const u16 *clut = &gpu_vram[m->clut_y * VRAM_W + m->clut_x];
     int i = 0;
 
-    if (m->u_and != 0xFF || m->u_or != 0 || u + n > 256) {
+    if (u < 0 || n <= 0 || u + n > 256 || m->u_and != 0xFF || m->u_or != 0) {
         return 0;
     }
     switch (m->textured) {
@@ -1526,17 +1527,35 @@ static int gpu_command_length(u32 code) {
     }
 }
 
+void port_framecsv_note(int kind);
+
+static void gpu_execute_body(void);
+
 static void gpu_execute(void) {
+    port_phase_begin(PORT_PHASE_GPU);
+    gpu_execute_body();
+    port_phase_end();
+}
+
+static void gpu_execute_body(void) {
     const u32 *w = g.cmd;
     u32 code = w[0] >> 24;
 
     switch (code >> 5) {
     case 1:
+        port_framecsv_note(0);
+        if (code & 8) {
+            port_framecsv_note(1);
+        }
+        if (code & 4) {
+            port_framecsv_note(2);
+        }
         gpu_polygon(w);
         return;
     case 2: {
         Mode m;
         Vertex a, b;
+        port_framecsv_note(3);
         int gour = (code & 0x10) != 0;
 
         gpu_line_mode(&m, code);
@@ -1678,6 +1697,7 @@ void gpu_load_image(int x, int y, int w, int h, const u16 *pixels) {
     gpu_gp0_write(((u32)(y & 0xFFFF) << 16) | (u32)(x & 0xFFFF));
     gpu_gp0_write(((u32)(h & 0xFFFF) << 16) | (u32)(w & 0xFFFF));
     n = g.load_left;
+    port_phase_begin(PORT_PHASE_GPU);
     if (!g.check_mask && g.load_i == 0 && n == g.load_w * g.load_h) {
         /* The transfer just started (the usual case): gpu_load_pixel's pixels, a row at a time. */
         int row, x;
@@ -1698,11 +1718,13 @@ void gpu_load_image(int x, int y, int w, int h, const u16 *pixels) {
         g.load_i = n;
         g.load_left = 0;
         gpu_load_done();
+        port_phase_end();
         return;
     }
     for (i = 0; i < n; i++) {
         gpu_load_pixel(pixels[i]);
     }
+    port_phase_end();
 }
 
 /* A save state (psyq_internal.h): the VRAM and the drawing state (a command or transfer in progress included). On a

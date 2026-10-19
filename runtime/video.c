@@ -38,9 +38,11 @@
  * 512), as the GPU's reads do. An interlaced 480-line display (the title's 320x480) is shown as one frame of both
  * fields, its lines in VRAM order (the PS1 draws the whole frame into VRAM; the TV interleaves the two fields). The
  * display is black while SetDispMask(0) holds or before the first PutDispEnv (then 320x240). */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "platform.h"
 #include "port_harness.h"
 #include "port_runtime.h"
 #include "psyq.h"
@@ -50,6 +52,10 @@
 
 #include "render_gpu.h"
 #include "render_gpu_textures.h"
+#elif defined(PSXSTACK_SDL2)
+#include <SDL2/SDL.h>
+#include <unistd.h>
+#include "fbdev_present.h"
 #endif
 
 #define VIDEO_MAX_W 640 /* screen pixels: the GPU's widest mode */
@@ -575,6 +581,164 @@ int port_video_gpu_screenshot_now(const char *path, int *w, int *h) {
     free(buf);
     return ok;
 }
+#elif defined(PSXSTACK_SDL2)
+static SDL_Window *video_window;
+static SDL_Renderer *video_renderer;
+static SDL_Texture *video_texture;
+static int video_tex_w, video_tex_h;
+static Uint32 video_start_ms;
+static long video_presents;
+static FbdevPresent fbdev;
+static int fbdev_active;
+
+int port_video_available(void) {
+    return 1;
+}
+
+int port_fbdev_active(void) {
+    return fbdev_active;
+}
+
+void port_video_open(int scale, int fullscreen) {
+    (void)scale;
+    const char *video_env = getenv("DW3_VIDEO");
+    int want_fbdev = (video_env && strcmp(video_env, "fbdev") == 0);
+    if (!video_env && !getenv("SDL_VIDEODRIVER")) {
+        if (access("/dev/fb0", R_OK | W_OK) == 0) {
+            want_fbdev = 1;
+        }
+    }
+    if (want_fbdev) {
+        char why[160];
+        if (Fbdev_Open(&fbdev, "/dev/fb0", why, sizeof(why)) == 0) {
+            fbdev_active = 1;
+            port_window = 1;
+            video_start_ms = SDL_GetTicks();
+            port_log("video: direct fbdev opened (/dev/fb0, %ux%u %ubpp, NEON 2x scaling)",
+                     fbdev.xres, fbdev.yres, fbdev.bits_per_pixel);
+            return;
+        } else {
+            port_log("video: fbdev open failed (%s); falling back to SDL2", why);
+        }
+    }
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) < 0) {
+        port_fatal("SDL_Init: %s", SDL_GetError());
+    }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    Uint32 flags = fullscreen ? SDL_WINDOW_FULLSCREEN : 0;
+    video_window = SDL_CreateWindow(PSXSTACK_GAME_ID, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    640, 480, flags);
+    if (video_window == NULL) {
+        port_fatal("SDL_CreateWindow: %s", SDL_GetError());
+    }
+    video_renderer = SDL_CreateRenderer(video_window, -1, SDL_RENDERER_ACCELERATED);
+    if (video_renderer == NULL) {
+        video_renderer = SDL_CreateRenderer(video_window, -1, 0);
+    }
+    if (video_renderer == NULL) {
+        port_fatal("SDL_CreateRenderer: %s", SDL_GetError());
+    }
+    SDL_RenderSetLogicalSize(video_renderer, 640, 480);
+    SDL_RendererInfo rinfo;
+    memset(&rinfo, 0, sizeof(rinfo));
+    SDL_GetRendererInfo(video_renderer, &rinfo);
+    port_window = 1;
+    video_start_ms = SDL_GetTicks();
+    port_log("video: SDL2 %d.%d.%d, driver %s, renderer %s, 640x480%s",
+             SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL,
+             SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "unknown",
+             rinfo.name ? rinfo.name : "unknown", fullscreen ? " (fullscreen)" : "");
+}
+
+void port_video_toggle_fullscreen(void) {
+    if (video_window != NULL) {
+        Uint32 f = SDL_GetWindowFlags(video_window);
+        SDL_SetWindowFullscreen(video_window, (f & SDL_WINDOW_FULLSCREEN) ? 0 : SDL_WINDOW_FULLSCREEN);
+    }
+}
+
+static void video_present(void) {
+    if (fbdev_active) {
+        Fbdev_Present(&fbdev, video_pixels, video_w, video_w, video_h);
+        video_presents++;
+        return;
+    }
+    if (video_renderer != NULL) {
+        if (video_texture == NULL || video_tex_w != video_w || video_tex_h != video_h) {
+            if (video_texture != NULL) {
+                SDL_DestroyTexture(video_texture);
+            }
+            video_texture = SDL_CreateTexture(video_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                              SDL_TEXTUREACCESS_STREAMING, video_w, video_h);
+            if (video_texture == NULL) {
+                port_fatal("SDL_CreateTexture %dx%d: %s", video_w, video_h, SDL_GetError());
+            }
+            video_tex_w = video_w;
+            video_tex_h = video_h;
+        }
+        SDL_UpdateTexture(video_texture, NULL, video_pixels, video_w * (int)sizeof(u32));
+        SDL_SetRenderDrawColor(video_renderer, 0, 0, 0, 255);
+        SDL_RenderClear(video_renderer);
+        SDL_RenderCopy(video_renderer, video_texture, NULL, NULL);
+        SDL_RenderPresent(video_renderer);
+        video_presents++;
+    }
+}
+
+void port_video_refresh(void) {
+    if (port_window) {
+        video_present();
+    }
+}
+
+void port_video_set_paused(int paused) {
+    (void)paused;
+}
+
+void port_video_set_status(const char *status) {
+    if (video_window != NULL && status != NULL) {
+        char title[128];
+        snprintf(title, sizeof(title), "%s%s%s", PSXSTACK_GAME_ID, *status ? " - " : "", status);
+        SDL_SetWindowTitle(video_window, title);
+    }
+}
+
+void port_video_close(void) {
+    if (port_window) {
+        double s = (double)(SDL_GetTicks() - video_start_ms) / 1000.0;
+        port_log("window: %ld frames presented in %.2f s (%.2f per second)", video_presents, s,
+                 s > 0 ? (double)video_presents / s : 0.0);
+    }
+}
+
+void port_video_quit(void) {
+    if (fbdev_active) {
+        Fbdev_Close(&fbdev);
+        fbdev_active = 0;
+    }
+    if (video_texture != NULL) {
+        SDL_DestroyTexture(video_texture);
+        video_texture = NULL;
+    }
+    if (video_renderer != NULL) {
+        SDL_DestroyRenderer(video_renderer);
+        video_renderer = NULL;
+    }
+    if (video_window != NULL) {
+        SDL_DestroyWindow(video_window);
+        video_window = NULL;
+    }
+    SDL_Quit();
+}
+
+static void video_gpu_shots_due(void) {
+}
+
+void port_video_gpu_headless(void) {}
+int port_video_dump_textures(const char *dir) { (void)dir; return 0; }
+int port_video_texture_pack(const char *dir) { (void)dir; return 0; }
+int port_video_gpu_screenshot_now(const char *path, int *w, int *h) { (void)path; (void)w; (void)h; return -1; }
 #else
 int port_video_available(void) {
     return 0;
@@ -674,12 +838,79 @@ static int video_due(void) {
         return 0;
     }
     last = now;
+#elif defined(PSXSTACK_SDL2)
+    static Uint32 last;
+    Uint32 now;
+    if (video_cap_hz <= 0) {
+        return 1;
+    }
+    now = SDL_GetTicks();
+    if (now - last < (Uint32)(1000 / video_cap_hz)) {
+        return 0;
+    }
+    last = now;
 #endif
     return 1;
 }
 
+/* One line a second. The old present bucket was this whole stretch: VRAM expand plus the blit. */
+static void video_present_stat(long long t0, int direct, int bits, int w, int h) {
+    static long long acc, sec0;
+    static int n;
+    long long now = port_clock_ns();
+    const char *path;
+    double ms;
+
+    if (sec0 == 0) {
+        sec0 = now;
+    }
+    acc += now - t0;
+    n++;
+    if (now - sec0 < 1000000000LL) {
+        return;
+    }
+    ms = n > 0 ? (double)acc / n / 1e6 : 0.0;
+    port_log("present: %.1f ms (%s %d-bit %dx%d)", ms, direct ? "direct" : "convert", bits, w, h);
+    path = getenv("DW3_PRESENT_LOG");
+    if (path != NULL && path[0] != '\0') {
+        FILE *f = fopen(path, "a");
+        if (f != NULL) {
+            fprintf(f, "present: %.1f ms (%s %d-bit %dx%d)\n", ms, direct ? "direct" : "convert", bits, w, h);
+            fclose(f);
+        }
+    }
+    acc = 0;
+    n = 0;
+    sec0 = now;
+}
+
+#if defined(PSXSTACK_SDL2)
+/* Skips the scalar expand when the framebuffer can take the VRAM rectangle directly. 1 if it drew. */
+static int video_present_direct(long long *t0) {
+    PsyqDisplay d;
+
+    if (!fbdev_active) {
+        return 0;
+    }
+    psyq_gpu_display(&d);
+    *t0 = port_clock_ns();
+    if (!d.enabled || d.w <= 0 || d.h <= 0) {
+        return 0;
+    }
+    if (Fbdev_PresentVram(&fbdev, psyq_gpu_vram(), d.x, d.y, d.w, d.h, d.rgb24) != 0) {
+        return 0;
+    }
+    video_w = d.w < VIDEO_MAX_W ? d.w : VIDEO_MAX_W;
+    video_h = d.h < VIDEO_MAX_H ? d.h : VIDEO_MAX_H;
+    video_presents++;
+    video_present_stat(*t0, 1, d.rgb24 ? 24 : 15, d.w, d.h);
+    return 1;
+}
+#endif
+
 void port_video_frame(void) {
     int i, shot = 0, present;
+    long long present_t0 = 0;
 #ifdef PSXSTACK_SDL
     render_gpu_frame(); /* the rasteriser's units of this vsync, presented or not: its target is state */
     render_gpu_tex_frame();
@@ -695,6 +926,12 @@ void port_video_frame(void) {
     if (!present && !shot) {
         return;
     }
+#if defined(PSXSTACK_SDL2)
+    if (present && !shot && video_present_direct(&present_t0)) {
+        return;
+    }
+#endif
+    present_t0 = port_clock_ns();
     video_convert();
     for (i = 0; i < video_shot_count; i++) {
         if (video_shots[i].frame == port_frames) {
@@ -703,6 +940,10 @@ void port_video_frame(void) {
     }
     video_gpu_shots_due();
     if (present) {
+        PsyqDisplay shown;
+
         video_present();
+        psyq_gpu_display(&shown);
+        video_present_stat(present_t0, 0, shown.rgb24 ? 24 : 15, video_w, video_h);
     }
 }

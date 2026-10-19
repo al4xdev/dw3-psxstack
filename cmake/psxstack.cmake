@@ -37,6 +37,7 @@ option(PSXSTACK_ALLOW_UNRESOLVED "Link with --unresolved-symbols=ignore-all (a b
 option(PSXSTACK_SANITIZE "Build with -fsanitize=address,undefined" OFF)
 option(PSXSTACK_M32 "Build a 32-bit binary (-m32, gcc-multilib): its --log must equal the 64-bit build's" OFF)
 option(PSXSTACK_SDL "The window (runtime/video.c, input.c) over SDL3 (tools/sdl3: scripts/setup.sh sdl3 dxc)" OFF)
+option(PSXSTACK_SDL2 "The window, input and audio over SDL2 and fbdev (R36S / embedded Linux)" OFF)
 option(PSXSTACK_PSYQ_WERROR "-Werror for the shim too (the runtime always has it)" ON)
 set(PSXSTACK_UNIT_OVERRIDES "" CACHE STRING
     "Experiments: units to build from another file, as <unit path>=<path> entries (the game's tree is untouched)")
@@ -192,8 +193,8 @@ function(psxstack_add_game target)
     endif()
 
     # ---- The game's units: one object library, each compiled through port_gen.py rename (C_COMPILER_LAUNCHER).
-    find_program(PSXSTACK_OBJCOPY NAMES objcopy NO_CMAKE_FIND_ROOT_PATH)
-    find_program(PSXSTACK_OBJDUMP NAMES objdump NO_CMAKE_FIND_ROOT_PATH)
+    find_program(PSXSTACK_OBJCOPY NAMES ${CMAKE_OBJCOPY} objcopy NO_CMAKE_FIND_ROOT_PATH)
+    find_program(PSXSTACK_OBJDUMP NAMES ${CMAKE_OBJDUMP} objdump NO_CMAKE_FIND_ROOT_PATH)
     if(NOT PSXSTACK_OBJCOPY OR NOT PSXSTACK_OBJDUMP)
         message(FATAL_ERROR "GNU objcopy and objdump (binutils) are needed on the host: the units' section renaming")
     endif()
@@ -307,7 +308,11 @@ function(psxstack_add_game target)
     endif()
     # The software GPU runs every frame: optimised in every build (-O3: its span loops rely on inlining and on the
     # vectorised select loops; psyq/gpu.c). The SPU core renders every audio frame: -O2 (runtime/spu*.c).
-    set_property(SOURCE "${PSXSTACK_ROOT}/psyq/gpu.c" APPEND PROPERTY COMPILE_OPTIONS -O3)
+    set_property(SOURCE "${PSXSTACK_ROOT}/psyq/gpu.c" APPEND PROPERTY COMPILE_OPTIONS -O3 -Wno-aggressive-loop-optimizations)
+    # The movie decoder and the geometry engine run every frame of a cutscene or a battle setup, and the rest of
+    # this target has no -O flag (GCC's -O0). -O2 here is the cheap experiment; the game's own C stays as it was.
+    set_property(SOURCE "${PSXSTACK_ROOT}/psyq/mdec.c" "${PSXSTACK_ROOT}/psyq/gte.c" "${PSXSTACK_ROOT}/psyq/libgte.c"
+                 APPEND PROPERTY COMPILE_OPTIONS -O2)
     file(GLOB SPU_SRCS CONFIGURE_DEPENDS "${PSXSTACK_ROOT}/runtime/spu*.c")
     set_property(SOURCE ${SPU_SRCS} APPEND PROPERTY COMPILE_OPTIONS -O2)
     # The link map, for reading. After every link the game's objects are checked: a writable section the compile
@@ -417,6 +422,14 @@ function(psxstack_add_game target)
         add_custom_target(${target}_shaders DEPENDS ${SHADER_HEADERS})
         add_dependencies(${target} ${target}_shaders)
         target_include_directories(${target} PRIVATE "${GEN}/shaders")
+    endif()
+    if(PSXSTACK_SDL2)
+        target_include_directories(${target} PRIVATE "/usr/include/SDL2")
+        target_link_libraries(${target} PRIVATE SDL2)
+        target_compile_definitions(${target} PRIVATE PSXSTACK_SDL2)
+        target_sources(${target} PRIVATE "${PSXSTACK_ROOT}/runtime/fbdev_present.c")
+        # The present is every frame (the measured 10 ms / 23 ms). -O3: the NEON expand below relies on it.
+        set_property(SOURCE "${PSXSTACK_ROOT}/runtime/fbdev_present.c" APPEND PROPERTY COMPILE_OPTIONS -O3)
     endif()
     message(STATUS "psxstack: ${target}: ${n_units} units")
 endfunction()

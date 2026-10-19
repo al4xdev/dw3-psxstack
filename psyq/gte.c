@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "psyq_internal.h"
+#include "phase.h"
 
 /* The 32 data registers (cop2r0-31) and the 32 control registers (cop2r32-63), as words. */
 static u32 gte_d[32];
@@ -519,6 +520,7 @@ void psyq_gte_cmd(u32 op) {
     int i;
     int k;
 
+    port_phase_begin(PORT_PHASE_GTE);
     gte_flag = 0;
     switch (op & 0x3F) {
     case 0x01: /* RTPS */
@@ -671,6 +673,7 @@ void psyq_gte_cmd(u32 op) {
         break;
     }
     gte_c[GTE_FLAG] = gte_flag;
+    port_phase_end();
 }
 
 /* A save state (psyq_internal.h): the registers (FLAG lives in control 31 between commands). The sub-pixel shadow is

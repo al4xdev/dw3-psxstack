@@ -821,6 +821,145 @@ void port_input_poll_paused(void) {
     }
     input_poll();
 }
+#elif defined(PSXSTACK_SDL2)
+#include <SDL2/SDL.h>
+
+static SDL_GameController *input_controller;
+static u16 input_applied;
+static int input_applied_any;
+
+void port_input_init(int test) {
+    input_test = test;
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS) < 0) {
+        port_log("input: SDL_InitSubSystem failed: %s", SDL_GetError());
+        return;
+    }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            input_controller = SDL_GameControllerOpen(i);
+            if (input_controller != NULL) {
+                port_log("input: opened game controller '%s'", SDL_GameControllerName(input_controller));
+                break;
+            }
+        }
+    }
+}
+
+static u16 input_read_buttons(void) {
+    u16 bits = 0;
+    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+
+    if (keys != NULL) {
+        if (keys[SDL_SCANCODE_UP]) bits |= PAD_UP;
+        if (keys[SDL_SCANCODE_DOWN]) bits |= PAD_DOWN;
+        if (keys[SDL_SCANCODE_LEFT]) bits |= PAD_LEFT;
+        if (keys[SDL_SCANCODE_RIGHT]) bits |= PAD_RIGHT;
+        if (keys[SDL_SCANCODE_X]) bits |= PAD_CROSS;
+        if (keys[SDL_SCANCODE_C]) bits |= PAD_CIRCLE;
+        if (keys[SDL_SCANCODE_Z]) bits |= PAD_SQUARE;
+        if (keys[SDL_SCANCODE_S]) bits |= PAD_TRIANGLE;
+        if (keys[SDL_SCANCODE_RETURN]) bits |= PAD_START;
+        if (keys[SDL_SCANCODE_RSHIFT]) bits |= PAD_SELECT;
+        if (keys[SDL_SCANCODE_Q]) bits |= PAD_L1;
+        if (keys[SDL_SCANCODE_W]) bits |= PAD_R1;
+        if (keys[SDL_SCANCODE_1]) bits |= PAD_L2;
+        if (keys[SDL_SCANCODE_2]) bits |= PAD_R2;
+    }
+
+    if (input_controller != NULL) {
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_UP)) bits |= PAD_UP;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) bits |= PAD_DOWN;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) bits |= PAD_LEFT;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) bits |= PAD_RIGHT;
+
+        Sint16 lx = SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_LEFTX);
+        Sint16 ly = SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_LEFTY);
+        if (lx < -12000) bits |= PAD_LEFT;
+        if (lx > 12000) bits |= PAD_RIGHT;
+        if (ly < -12000) bits |= PAD_UP;
+        if (ly > 12000) bits |= PAD_DOWN;
+
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_A)) bits |= PAD_CROSS;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_B)) bits |= PAD_CIRCLE;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_X)) bits |= PAD_SQUARE;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_Y)) bits |= PAD_TRIANGLE;
+
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_BACK)) bits |= PAD_SELECT;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_START)) bits |= PAD_START;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) bits |= PAD_L1;
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) bits |= PAD_R1;
+
+        if (SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) bits |= PAD_L2;
+        if (SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) bits |= PAD_R2;
+
+        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_BACK) &&
+            SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_START)) {
+            port_exit(0, "Quit hotkey Select+Start pressed");
+        }
+
+        static int l3_r3_was_down;
+        int l3 = SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_LEFTSTICK);
+        int r3 = SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+        if (l3 && r3) {
+            if (!l3_r3_was_down) {
+                l3_r3_was_down = 1;
+                static int ff_active = 0;
+                ff_active = !ff_active;
+                port_fast_forward_request(ff_active);
+                port_log("handheld: hotkey L3+R3: fast-forward %s", ff_active ? "ON" : "OFF");
+            }
+        } else {
+            l3_r3_was_down = 0;
+        }
+    }
+    return bits;
+}
+
+static void input_poll(void) {
+    extern int port_fbdev_active(void);
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        switch (e.type) {
+        case SDL_QUIT:
+            if (!port_fbdev_active()) {
+                port_exit(0, "window closed");
+            }
+            break;
+        case SDL_CONTROLLERDEVICEADDED:
+            if (input_controller == NULL) {
+                input_controller = SDL_GameControllerOpen(e.cdevice.which);
+                if (input_controller != NULL) {
+                    port_log("input: attached game controller '%s'", SDL_GameControllerName(input_controller));
+                }
+            }
+            break;
+        case SDL_CONTROLLERDEVICEREMOVED:
+            if (input_controller != NULL) {
+                SDL_GameControllerClose(input_controller);
+                input_controller = NULL;
+                port_log("input: removed game controller");
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void port_input_frame(void) {
+    input_poll();
+    if (!port_script_active && !port_debug_pad_owned) {
+        u16 bits = input_read_buttons();
+        psyq_pad_set(0, 1, bits);
+        port_framelog_input(bits);
+        input_applied = bits;
+        input_applied_any = 1;
+    }
+}
+
+void port_input_poll_paused(void) {
+    input_poll();
+}
 #else
 void port_input_init(int test) {
     input_test = input_test_mute = test;

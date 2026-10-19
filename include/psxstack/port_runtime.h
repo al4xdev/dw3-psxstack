@@ -71,6 +71,9 @@ extern long port_max_frames;  /* --max-frames: port_wait() exits 0 after this ma
 extern long port_frames;      /* vsync ticks so far (frames) */
 extern int port_script_active; /* --script given: port_script_frame runs every frame */
 extern int port_watchdog_sec; /* --watchdog: exit 4 after this many wall-clock seconds without a port_wait() */
+void port_framecsv_open(const char *path); /* framecsv.c: one CSV line per frame, or a no-op */
+void port_framecsv_frame(void);
+void port_framecsv_close(void);
 void port_pump_init(void);
 /* ---- The console's reset (reset.c; port_harness.h): each part back to power-on */
 void port_overlay_reset(void);                 /* overlay.c: every game section from its startup snapshot */

@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "phase.h"
 #include "port_harness.h"
 #include "port_runtime.h"
 #include "savestate.h"
@@ -47,6 +48,10 @@
 
 #ifdef PSXSTACK_SDL
 #include <SDL3/SDL.h>
+#elif defined(PSXSTACK_SDL2)
+#include <SDL2/SDL.h>
+static SDL_AudioDeviceID audio_dev;
+static int audio_muted;
 #endif
 
 #define AUDIO_WAV_HEADER 44
@@ -266,6 +271,34 @@ static void audio_device_close(void) {
         audio_stream = NULL;
     }
 }
+#elif defined(PSXSTACK_SDL2)
+static void audio_device_open(void) {
+    SDL_AudioSpec wanted, obtained;
+    memset(&wanted, 0, sizeof(wanted));
+    wanted.freq = SPU_RATE;
+    wanted.format = AUDIO_S16SYS;
+    wanted.channels = 2;
+    wanted.samples = 1024;
+    wanted.callback = NULL;
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+        port_log("audio: SDL_InitSubSystem failed: %s", SDL_GetError());
+        return;
+    }
+    audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted, &obtained, 0);
+    if (audio_dev == 0) {
+        port_log("audio: cannot open audio device: %s", SDL_GetError());
+    } else {
+        SDL_PauseAudioDevice(audio_dev, 0);
+        port_log("audio: opened %d Hz stereo 16-bit audio device (SDL2)", obtained.freq);
+    }
+}
+
+static void audio_device_close(void) {
+    if (audio_dev != 0) {
+        SDL_CloseAudioDevice(audio_dev);
+        audio_dev = 0;
+    }
+}
 #else
 static void audio_device_open(void) {
     port_log("audio: this build has no audio device (configure with -DPSXSTACK_SDL=ON); the run goes on silent");
@@ -300,7 +333,9 @@ void port_audio_open(int device, const char *wav_path) {
 void port_audio_frame(void) {
     long long n = audio_vsync;
     int frames = (int)((n + 1) * SPU_RATE / audio_rate - n * SPU_RATE / audio_rate);
+    port_phase_begin(PORT_PHASE_AUDIO);
     spu_render(audio_buf, frames);
+    port_phase_end();
     audio_vsync++;
     if (audio_wav != NULL) {
         audio_wav_write(audio_buf, frames);
@@ -308,6 +343,10 @@ void port_audio_frame(void) {
 #ifdef PSXSTACK_SDL
     if (audio_stream != NULL) {
         audio_device_frame(audio_buf, frames);
+    }
+#elif defined(PSXSTACK_SDL2)
+    if (audio_dev != 0 && !audio_muted) {
+        SDL_QueueAudio(audio_dev, audio_buf, (Uint32)(frames * 4));
     }
 #endif
 }
@@ -318,6 +357,11 @@ void port_audio_set_mute(int mute) {
         SDL_ClearAudioStream(audio_stream);
         audio_started = 0; /* the first put after it is a start, not a refill */
         audio_avg = audio_target;
+    }
+    audio_muted = mute;
+#elif defined(PSXSTACK_SDL2)
+    if (audio_dev != 0 && mute != audio_muted) {
+        SDL_ClearQueuedAudio(audio_dev);
     }
     audio_muted = mute;
 #else
@@ -333,6 +377,10 @@ void port_audio_pause(int paused) {
         } else {
             SDL_ResumeAudioStreamDevice(audio_stream);
         }
+    }
+#elif defined(PSXSTACK_SDL2)
+    if (audio_dev != 0) {
+        SDL_PauseAudioDevice(audio_dev, paused);
     }
 #else
     (void)paused;
