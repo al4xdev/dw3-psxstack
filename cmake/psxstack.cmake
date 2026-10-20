@@ -444,6 +444,10 @@ function(psxstack_add_game target)
         target_sources(${target} PRIVATE "${PSXSTACK_ROOT}/runtime/render_gles.c")
         target_compile_definitions(${target} PRIVATE PSXSTACK_EGL)
         target_link_libraries(${target} PRIVATE EGL GLESv2 gbm)
+        # Every frame runs the display readback and its 8-to-5-bit conversion; at the runtime's default -O0 that loop
+        # cost 7.5 ms of a 20 ms frame on the handheld (measured with DW3_GLES_LOG). -O3 turns the three /255 into
+        # multiply-shifts.
+        set_property(SOURCE "${PSXSTACK_ROOT}/runtime/render_gles.c" APPEND PROPERTY COMPILE_OPTIONS -O3)
     endif()
     message(STATUS "psxstack: ${target}: ${n_units} units")
 endfunction()

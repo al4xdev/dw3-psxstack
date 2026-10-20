@@ -56,6 +56,9 @@
 #include <SDL2/SDL.h>
 #include <unistd.h>
 #include "fbdev_present.h"
+#ifdef PSXSTACK_EGL
+#include "render_gles.h"
+#endif
 #endif
 
 #define VIDEO_MAX_W 640 /* screen pixels: the GPU's widest mode */
@@ -72,6 +75,7 @@ static struct {
 static int video_shot_count;
 static long video_converted_frame = -1; /* the frame video_pixels was converted at (the debug channel's screenshot) */
 static int video_gpu_wanted;            /* --renderer gpu / video.renderer "gpu" */
+static int video_gles_wanted;           /* --renderer gles: the offscreen GLES renderer (render_gles.c) */
 static int video_internal_scale = 1;    /* --internal-scale / video.internal_scale: the rasteriser's, 1..8 */
 static PortFilter video_filter;         /* --filter / video.filter: the hardware renderer's present (render_gpu_present.c) */
 static struct {
@@ -179,8 +183,9 @@ static int video_try_ppm(const char *path) {
 }
 
 int port_video_set_renderer(const char *name) {
-    if (strcmp(name, "software") == 0 || strcmp(name, "gpu") == 0) {
+    if (strcmp(name, "software") == 0 || strcmp(name, "gpu") == 0 || strcmp(name, "gles") == 0) {
         video_gpu_wanted = name[0] == 'g';
+        video_gles_wanted = strcmp(name, "gles") == 0;
         return 1;
     }
     return 0;
@@ -598,6 +603,11 @@ static Uint32 video_start_ms;
 static long video_presents;
 static FbdevPresent fbdev;
 static int fbdev_active;
+#ifdef PSXSTACK_EGL
+static int video_gles; /* the offscreen GLES renderer draws; the present still comes out through fbdev */
+/* The display area as the renderer reads it back: 320x240 of 16-bit pixels, presented by Fbdev_PresentVram. */
+static u16 video_gles_display[VIDEO_MAX_W * VIDEO_MAX_H];
+#endif
 
 int port_video_available(void) {
     return 1;
@@ -624,6 +634,25 @@ void port_video_open(int scale, int fullscreen) {
             video_start_ms = SDL_GetTicks();
             port_log("video: direct fbdev opened (/dev/fb0, %ux%u %ubpp, NEON 2x scaling)",
                      fbdev.xres, fbdev.yres, fbdev.bits_per_pixel);
+#ifdef PSXSTACK_EGL
+            if (video_gles_wanted) {
+                /* The offscreen renderer draws; the picture still leaves through fbdev (a window swap costs 17 ms on
+                 * this handheld, the fb0 present 0.77 ms: docs/gpu/measurements.txt). */
+                char gles_why[160] = {0};
+
+                if (render_gles_open(gles_why, sizeof(gles_why)) &&
+                    render_gles_raster_start(1, gles_why, sizeof(gles_why))) {
+                    video_gles = 1;
+                    port_log("renderer: gles (%s)", render_gles_describe());
+                } else {
+                    port_log("renderer: gles unavailable (%s); the software renderer draws", gles_why);
+                }
+            }
+#elif defined(PSXSTACK_SDL2)
+            if (video_gles_wanted) {
+                port_log("renderer: gles needs -DPSXSTACK_EGL=ON; the software renderer draws");
+            }
+#endif
             return;
         } else {
             port_log("video: fbdev open failed (%s); falling back to SDL2", why);
@@ -721,6 +750,12 @@ void port_video_close(void) {
 }
 
 void port_video_quit(void) {
+#ifdef PSXSTACK_EGL
+    if (video_gles) {
+        render_gles_close();
+        video_gles = 0;
+    }
+#endif
     if (fbdev_active) {
         Fbdev_Close(&fbdev);
         fbdev_active = 0;
@@ -918,6 +953,21 @@ static int video_present_direct(long long *t0) {
     if (!d.enabled || d.w <= 0 || d.h <= 0) {
         return 0;
     }
+#ifdef PSXSTACK_EGL
+    if (video_gles && d.w <= VIDEO_MAX_W && d.h <= VIDEO_MAX_H) {
+        /* The display's pixels come from the renderer's VRAM target, not from the shim's array: with the listener
+         * replacing the rasteriser, the array has only what the transfers wrote. The 24-bit modes stay on the software
+         * path for now (the GLES target holds 5-5-5-1, and nothing in this game's battles uses them). */
+        if (render_gles_read_display(video_gles_display, d.x, d.y, d.w, d.h) &&
+            Fbdev_PresentVram(&fbdev, video_gles_display, d.w, 0, 0, d.w, d.h, d.rgb24) == 0) {
+            video_w = d.w;
+            video_h = d.h;
+            video_presents++;
+            video_present_stat(*t0, 1, d.rgb24 ? 24 : 15, d.w, d.h);
+            return 1;
+        }
+    }
+#endif
     if (Fbdev_PresentVram(&fbdev, psyq_gpu_vram(), psyq_gpu_vram_stride(), d.x, d.y, d.w, d.h, d.rgb24) != 0) {
         return 0;
     }

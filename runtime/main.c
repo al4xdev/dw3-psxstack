@@ -73,7 +73,7 @@ static void usage(const char *argv0) {
             "          [--script JSON]\n"
             "          [--log FILE] [--record FILE] [--max-frames N] [--watchdog SEC] [--trace]\n"
             "          [--window] [--scale N] [--fullscreen] [--fps N] [--input-test] [--screenshot FRAME:PATH]\n"
-            "          [--renderer software|gpu] [--internal-scale N] [--gpu-screenshot FRAME[@WxH]:PATH]\n"
+            "          [--renderer software|gpu|gles] [--internal-scale N] [--gpu-screenshot FRAME[@WxH]:PATH]\n"
             "          [--subpixel off|on|perspective]\n"
             "          [--filter NAME[:KEY=V,...]]\n"
             "          [--spu-trace FILE] [--wav FILE] [--mute] [--debug SOCKET] [--debug-hold] [--crash-dir DIR]\n"
@@ -110,8 +110,10 @@ static void usage(const char *argv0) {
             "  --input-test     the window's input self-test: injected key and gamepad events (implies --window);\n"
             "                   exit 0 = passed, 6 = failed\n"
             "  --screenshot F:P write the display at vsync F to P (binary PPM); repeatable; any build\n"
-            "  --renderer R     the window's renderer: software (default: SDL_Renderer) or gpu (SDL_GPU, the\n"
-            "                   hardware renderer; software when no device can present; overrides video.renderer)\n"
+            "  --renderer R     the window's renderer: software (default: SDL_Renderer), gpu (SDL_GPU, the\n"
+            "                   hardware renderer; software when no device can present; overrides video.renderer),\n"
+            "                   or gles (the offscreen GLES renderer of a -DPSXSTACK_EGL build: it draws into a VRAM\n"
+            "                   texture and the picture leaves through the fb0 present)\n"
             "  --internal-scale N  the hardware renderer's resolution: 1 to 8 times the PS1's (default 1: the same\n"
             "                   picture as software; above 1 without dithering, in 8-bit colour; overrides\n"
             "                   video.internal_scale)\n"
@@ -176,6 +178,7 @@ int main(int argc, char **argv) {
     int memcard_given[2] = { 0, 0 };
     int disc_check = 1, max_frames_given = 0;
     int window = 0, scale = 2, fullscreen = 0, input_test = 0, gpu = 0, gpu_shots = 0, internal_scale = 1;
+    const char *renderer = "software";
     int subpixel = 1;
     const char *config = NULL;
     PortFilter filter = PORT_FILTER_DEFAULTS;
@@ -300,11 +303,13 @@ int main(int argc, char **argv) {
                 return 64;
             }
         } else if (strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
-            if (strcmp(argv[i + 1], "software") != 0 && strcmp(argv[i + 1], "gpu") != 0) {
-                fprintf(stderr, "port: --renderer: software or gpu\n");
+            if (strcmp(argv[i + 1], "software") != 0 && strcmp(argv[i + 1], "gpu") != 0 &&
+                strcmp(argv[i + 1], "gles") != 0) {
+                fprintf(stderr, "port: --renderer: software, gpu or gles\n");
                 return 64;
             }
-            gpu = argv[++i][0] == 'g';
+            renderer = argv[++i];
+            gpu = renderer[0] == 'g';
         } else if (strcmp(argv[i], "--internal-scale") == 0 && i + 1 < argc) {
             internal_scale = (int)number(argv[i + 1], argv[i]);
             i++;
@@ -416,7 +421,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "port: --texture-pack: this build has no hardware renderer: configure with -DPSXSTACK_SDL=ON\n");
         return 64;
     }
-    port_video_set_renderer(gpu ? "gpu" : "software");
+    port_video_set_renderer(renderer);
     port_video_set_internal_scale(internal_scale);
     port_video_set_subpixel(subpixel);
     port_video_set_filter(&filter);

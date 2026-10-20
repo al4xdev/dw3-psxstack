@@ -31,6 +31,7 @@
 #include <GLES2/gl2.h>
 #include <gbm.h>
 
+#include "platform.h"
 #include "port_harness.h"
 #include "port_runtime.h"
 #include "psyq_internal.h"
@@ -313,6 +314,75 @@ int render_gles_rasterising(void) {
 /* Once per vsync. The transfers upload as they happen, so nothing is pending here yet; this is where the batch
  * flush, the read copy (blit of the dirty rectangle) and the display pass land as M2 and M3 arrive. */
 void render_gles_frame(void) {
+}
+
+/* The display area back as 16-bit pixels, for the present that already exists (runtime/fbdev_present.c does the 2x
+ * nearest scaling and the 15-to-16-bit expansion with NEON, 0.77 ms measured). Reading 320x240 costs 1.7-1.95 ms
+ * (docs/gpu/measurements.txt): cheaper than the 17 ms a window swap would cost, and it leaves the present path, the
+ * screenshots and the 24-bit modes exactly as they are. 0 on failure. */
+int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
+    u8 *rgba;
+    int i, j;
+    /* DW3_GLES_LOG=1: what the display readback costs, split in its two halves (the driver's glReadPixels and the
+     * 8-to-5-bit conversion below), once a second. The present is where a measurement surprised: 9.8 ms on the
+     * handheld against the 1.7 the spike predicted. */
+    static long long log_sec;
+    static unsigned long long log_read, log_conv;
+    static unsigned log_n;
+    static int log_on = -1;
+    long long t_read = 0;
+
+    if (!gles_rasterising || out == NULL || w <= 0 || h <= 0) {
+        return 0;
+    }
+    if (log_on < 0) {
+        const char *env = getenv("DW3_GLES_LOG");
+
+        log_on = env != NULL && env[0] == '1';
+    }
+    rgba = malloc((size_t)w * (size_t)h * 4);
+    if (rgba == NULL) {
+        return 0;
+    }
+    if (log_on) {
+        t_read = (long long)port_clock_ns();
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
+    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    if (log_on) {
+        long long t1 = (long long)port_clock_ns();
+
+        log_read += (unsigned long long)(t1 - t_read);
+        t_read = t1;
+    }
+    for (j = 0; j < h; j++) {
+        for (i = 0; i < w; i++) {
+            const u8 *p = rgba + ((size_t)j * w + i) * 4;
+            unsigned r = ((unsigned)p[0] * 31 + 127) / 255;
+            unsigned g = ((unsigned)p[1] * 31 + 127) / 255;
+            unsigned b = ((unsigned)p[2] * 31 + 127) / 255;
+
+            out[(size_t)j * w + i] = (u16)((r & 31) | ((g & 31) << 5) | ((b & 31) << 10));
+        }
+    }
+    free(rgba);
+    if (log_on) {
+        long long now = (long long)port_clock_ns();
+
+        log_conv += (unsigned long long)(now - t_read);
+        log_n++;
+        if (log_sec == 0) {
+            log_sec = now;
+        } else if (now - log_sec >= 1000000000LL) {
+            port_log("gles: present readback %.2f ms (glReadPixels %.2f, 5-bit conversion %.2f), %u presents",
+                     (double)(log_read + log_conv) / log_n / 1e6, (double)log_read / log_n / 1e6,
+                     (double)log_conv / log_n / 1e6, log_n);
+            log_read = log_conv = 0;
+            log_n = 0;
+            log_sec = now;
+        }
+    }
+    return 1;
 }
 
 /* The whole target back as the shim's 16-bit pixels: the exactness test's comparison (and, later, the checkpoint).
