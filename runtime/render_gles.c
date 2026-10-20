@@ -239,7 +239,10 @@ static const char *GLES_TEX_FS =
     "    texel = word(ivec2(v_page.x + uv.x, v_page.y + uv.y));\n"
     "  }\n"
     "  vec4 t = unpack5(texel);\n"
-    "  if (depth != 3 && (texel & 0x7FFFu) == 0u) { discard; }\n" /* the PS1's transparent texel */
+    /* The PS1 skips only a texel that is exactly 0x0000 (gpu.c gpu_pixel: "if (t == 0) return"). A texel of 0x8000
+     * is a real pixel - colour 0 with the mask bit set - and the shim draws it; testing the low 15 bits instead
+     * dropped it and left the previous content there, which was the 502-pixel difference the VRAM check found. */
+    "  if (depth != 3 && texel == 0u) { discard; }\n"
     "  vec3 colour = raw ? t.rgb : floor(t.rgb * v_col.rgb / 128.0);\n"
     "  colour = min(colour, vec3(31.0));\n"
     "  float mask = ((texel & 0x8000u) != 0u || u_set_mask != 0) ? 1.0 : 0.0;\n"
