@@ -51,11 +51,15 @@ int Fbdev_Validate(const FbdevPresent *fb, char *why, size_t why_size) {
     return 0;
 }
 
+/* The display size whose letterbox was last cleared (Fbdev_PresentVram); reset when the device is reopened. */
+static int fbdev_cleared_w, fbdev_cleared_h;
+
 int Fbdev_Open(FbdevPresent *fb, const char *device, char *why, size_t why_size) {
     if (!fb || !device) {
         fail(why, why_size, "invalid arguments");
         return -1;
     }
+    fbdev_cleared_w = fbdev_cleared_h = 0;
     memset((uint8_t *)fb + 4, 0, sizeof(*fb) - 4);
     fb->fd = -1;
     fb->fd = open(device, O_RDWR | O_CLOEXEC);
@@ -316,7 +320,6 @@ static void fb_row24_neon(const uint8_t *src, int n, uint32_t *dst, uint32_t *ds
 
 int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int w, int h, int rgb24) {
     int sx, sy, dst_x, dst_y, row, copy_h, src_y_off;
-    static int cleared_w, cleared_h;
 
     if (Fbdev_Validate(fb, NULL, 0) < 0 || !vram || w <= 0 || h <= 0) {
         return -1;
@@ -335,8 +338,8 @@ int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int 
         return -1;
     }
 #if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
-    (void)cleared_w;
-    (void)cleared_h;
+    (void)fbdev_cleared_w;
+    (void)fbdev_cleared_h;
     return -1;
 #else
     int scale_y = h <= 256 ? 2 : 1;
@@ -352,10 +355,10 @@ int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int 
     if (copy_h > (int)fb->yres / scale_y) {
         copy_h = (int)fb->yres / scale_y;
     }
-    if (w != cleared_w || h != cleared_h) {
+    if (w != fbdev_cleared_w || h != fbdev_cleared_h) {
         memset(fb->pixels, 0, (size_t)fb->line_length * fb->yres);
-        cleared_w = w;
-        cleared_h = h;
+        fbdev_cleared_w = w;
+        fbdev_cleared_h = h;
     }
     for (row = 0; row < copy_h; row++) {
         int vy = (sy + src_y_off + row) & 511;

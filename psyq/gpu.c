@@ -577,6 +577,25 @@ GPU_INLINE void gpu_interp_step(Interp *it, int d) {
 }
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+/* Can this span's textured pixels come from the very row it writes? The scalar loops read a texel and write its
+ * pixel one at a time, so a triangle that draws over its own texture sees its own writes. The vector loop fetches
+ * eight texels before writing eight pixels, which would read stale texels in that case. Rows are compared through
+ * the whole v range the span can touch (one step per pixel, rounded up), and the span falls back to scalar when
+ * they meet. */
+static int gpu_span_row_clear(const Mode *m, int y, int n, const Interp *iv, int av) {
+    int v0 = ((av + iv->q) & m->v_and) | m->v_or;
+    int v1 = ((av + iv->q + n * (iv->sq + (iv->srem > 0))) & m->v_and) | m->v_or;
+    int lo = v0 < v1 ? v0 : v1, hi = v0 < v1 ? v1 : v0;
+    int r0 = (m->tex_y + lo) & 511, r1 = (m->tex_y + hi) & 511;
+    int dy = y & 511;
+
+    /* The texture rows touched are r0..r1, wrapping at 512: the span is safe unless dy is among them. */
+    if (r0 <= r1) {
+        return dy < r0 || dy > r1;
+    }
+    return dy < r0 && dy > r1;
+}
+
 /* A span of a one-colour textured triangle whose blend is opaque: gpu_shade_flat's `blend == GPU_OPAQUE` branch,
  * eight pixels at a time. The texels are still fetched one by one (ARMv7 has no gather); the modulation, the
  * clamp to 31 and the packing are vector. Every value is exact 16-bit arithmetic, so the pixels are the scalar
@@ -665,7 +684,7 @@ GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int y, int n, Interp 
     int i;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    if (blend == GPU_OPAQUE && depth != 0) {
+    if (blend == GPU_OPAQUE && depth != 0 && gpu_span_row_clear(m, y, n, &iv, av)) {
         gpu_span_flat_neon(m, dst, y, n, &iu, &iv, au, av, d, r, gg, b, depth);
         return;
     }
@@ -808,7 +827,7 @@ GPU_INLINE void gpu_span_gouraud_tri(const Mode *m, u16 *dst, int x, int y, int 
     int i;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    if (depth != 0 && !eight && !semi && !gpu_neon_gouraud_off) {
+    if (depth != 0 && !eight && !semi && !gpu_neon_gouraud_off && gpu_span_row_clear(m, y, n, &iv, av)) {
         gpu_span_gouraud_neon(m, dst, y, n, it, a, d);
         return;
     }
