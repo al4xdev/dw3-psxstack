@@ -152,6 +152,11 @@ const u16 *gpu_vram_pixels(void) {
     return gpu_vram;
 }
 
+/* The one writable way in: a save state, after the renderer's target has been read back (savestate.c). */
+u16 *gpu_vram_pixels_mut(void) {
+    return gpu_vram;
+}
+
 /* The row stride of gpu_vram_pixels' rows: 1024 visible pixels plus the padding that keeps consecutive rows out of the
  * same cache set (VRAM_STRIDE above). */
 int gpu_vram_stride(void) {

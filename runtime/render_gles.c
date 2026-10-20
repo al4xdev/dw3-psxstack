@@ -1308,7 +1308,7 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
  * glReadPixels of 1024x512 costs 10.8 ms on the handheld, so this is a save-time operation, never per frame. */
 int render_gles_read_vram(u16 *out) {
     u8 *rgba;
-    int x, y;
+    int x, y, stride;
 
     if (!gles_rasterising || out == NULL) {
         return 0;
@@ -1319,6 +1319,9 @@ int render_gles_read_vram(u16 *out) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
     glReadPixels(0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    /* 1024 wide, the caller's layout: the shim's own array is padded (gpu_vram_stride) and a caller that wants that
+     * arrangement - a save state - copies each row there itself (savestate.c). */
+    stride = VRAM_W;
     for (y = 0; y < VRAM_H; y++) {
         for (x = 0; x < VRAM_W; x++) {
             const u8 *p = rgba + ((size_t)y * VRAM_W + x) * 4;
@@ -1326,7 +1329,8 @@ int render_gles_read_vram(u16 *out) {
             unsigned g = ((unsigned)p[1] * 31 + 127) / 255;
             unsigned b = ((unsigned)p[2] * 31 + 127) / 255;
 
-            out[(size_t)y * VRAM_W + x] = (u16)((r & 31) | ((g & 31) << 5) | ((b & 31) << 10) | (p[3] >= 128 ? 0x8000 : 0));
+            out[(size_t)y * (size_t)stride + x] =
+                (u16)((r & 31) | ((g & 31) << 5) | ((b & 31) << 10) | (p[3] >= 128 ? 0x8000 : 0));
         }
     }
     free(rgba);

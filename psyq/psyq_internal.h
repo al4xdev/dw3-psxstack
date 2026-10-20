@@ -89,6 +89,9 @@ void gpu_gp0_write(u32 word);
 void gpu_gp0_words(const u32 *w, u32 n);
 void gpu_load_image(int x, int y, int w, int h, const u16 *pixels);
 const u16 *gpu_vram_pixels(void);
+/* The same array, writable, for the one caller that has VRAM the shim does not: a listener that replaces the rasteriser
+ * draws into its own target, so a save state has to write what was drawn back here before it captures the VRAM. */
+u16 *gpu_vram_pixels_mut(void);
 int gpu_vram_stride(void);
 void gpu_draw_state(u32 *e1, u32 *e3, u32 *e4, u32 *e5);
 /* Span mix for DW3_GPU_LOG. Off unless that path is set: the checks are one load. */

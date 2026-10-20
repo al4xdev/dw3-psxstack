@@ -46,6 +46,10 @@
 #include "port_harness.h"
 #include "port_runtime.h"
 #include "psyq.h"
+#include "psyq_internal.h" /* gpu_vram_pixels_mut: the VRAM a renderer's target has to write back into */
+#ifdef PSXSTACK_EGL
+#include "render_gles.h"
+#endif
 #include "savestate.h"
 #include "sha1.h"
 #include "spu.h"
@@ -345,8 +349,39 @@ static int state_header_check(const StateHeader *h, const char *path, char *err,
 
 /* ---- The whole state, both directions */
 
+/* While a listener replaces the rasteriser the shim's VRAM holds only the transfers: the drawing lives in the
+ * renderer's own target. A state has to carry what was drawn, so the target is read back into it first (and a load puts
+ * it back through the listener's power-on event, gpu.c gpu_state). */
+static void state_vram_from_renderer(void) {
+#ifdef PSXSTACK_EGL
+    unsigned short *vram, *rows;
+    int stride, y;
+
+    if (!render_gles_rasterising()) {
+        return;
+    }
+    vram = gpu_vram_pixels_mut();
+    /* render_gles_read_vram fills 1024-wide rows; the shim's array has VRAM_W + the padding between them. */
+    rows = vram != NULL ? malloc((size_t)1024 * 512 * 2) : NULL;
+    if (rows == NULL) {
+        port_log("state: the renderer's VRAM cannot be read back; the state's VRAM is the transfers' alone");
+        return;
+    }
+    stride = psyq_gpu_vram_stride();
+    if (render_gles_read_vram(rows)) {
+        for (y = 0; y < 512; y++) {
+            memcpy(&vram[(size_t)y * (size_t)stride], &rows[(size_t)y * 1024], 1024 * 2);
+        }
+    }
+    free(rows);
+#endif
+}
+
 static void state_sync(PortState *s, StateHeader *h) {
     uint64_t lo;
+    if (!s->loading) {
+        state_vram_from_renderer();
+    }
     port_state_bytes(s, "header", h, sizeof(*h));
     PORT_STATE_VAR(s, port_frames);
     port_audio_state(s);
