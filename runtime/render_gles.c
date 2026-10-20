@@ -83,11 +83,13 @@ static int gles_batch_n;
 static GLuint gles_prog_flat, gles_prog_tex, gles_vbo;
 static GLint gles_loc_pos = -1, gles_loc_col = -1; /* the flat program's */
 static struct {
-    GLint pos, col, uv, page, win, flags, vram, set_mask;
+    GLint pos, col, uv, page, win, flags, vram, set_mask, semi, check;
 } gles_tex_loc;
 static int gles_batch_textured; /* the kind of primitives in the batch: the two programs cannot mix */
 static int gles_batch_area[4] = {-1, -1, -1, -1};
 static int gles_batch_mask = -1;
+static int gles_batch_semi = -1;   /* 0 opaque, 1..4 the PS1's modes */
+static int gles_batch_check = -1;  /* the mask test */
 static int gles_drawn[4];          /* what the target has drawn since the read copy was last refreshed */
 static int gles_replace = 1;  /* the listener draws instead of the software rasteriser (--renderer gles) */
 static int gles_off_flat;     /* DW3_GLES_NOFLAT=1: untextured primitives are counted, not drawn (bisecting) */
@@ -195,10 +197,14 @@ static const char *GLES_TEX_VS =
 
 static const char *GLES_TEX_FS =
     "#version 300 es\n"
+    "#extension GL_ARM_shader_framebuffer_fetch : require\n" /* the destination read: semi-transparency and the mask
+                                                              * test, exact and free on this device (docs/gpu/06) */
     "precision highp float;\n"
     "precision highp int;\n"
     "uniform highp sampler2D u_vram;\n"
     "uniform int u_set_mask;\n"
+    "uniform int u_semi;\n"      /* 0 opaque; 1..4 the PS1's modes 0..3 */
+    "uniform int u_check_mask;\n"
     "in vec4 v_col;\n"
     "in vec2 v_uv;\n"
     "flat in ivec4 v_page;\n"
@@ -237,6 +243,20 @@ static const char *GLES_TEX_FS =
     "  vec3 colour = raw ? t.rgb : floor(t.rgb * v_col.rgb / 128.0);\n"
     "  colour = min(colour, vec3(31.0));\n"
     "  float mask = ((texel & 0x8000u) != 0u || u_set_mask != 0) ? 1.0 : 0.0;\n"
+    /* The destination, through the ARM/Mali fragment-fetch extension: the mask test and the four PS1 modes, in 5-bit
+     * units with the shim's clamping (gpu.c gpu_blend). A pixel only blends where the texel's bit 15 is set. */
+    "  vec4 bg = gl_LastFragColorARM;\n"
+    "  vec3 bg5 = floor(bg.rgb * 31.0 + 0.5);\n"
+    "  if (u_check_mask != 0 && bg.a > 0.5) { discard; }\n"
+    "  bool blend = u_semi != 0 && (u_semi == 1 || (texel & 0x8000u) != 0u);\n"
+    "  if (blend) {\n"
+    "    int mode = u_semi - 1;\n"
+    "    if (mode == 0) { colour = floor((bg5 + colour) * 0.5); }\n"
+    "    else if (mode == 1) { colour = min(bg5 + colour, vec3(31.0)); }\n"
+    "    else if (mode == 2) { colour = max(bg5 - colour, vec3(0.0)); }\n"
+    "    else { colour = min(bg5 + floor(colour * 0.25), vec3(31.0)); }\n"
+    "    colour = min(colour, vec3(31.0));\n"
+    "  }\n"
     "  o_col = vec4(floor(colour * 8.22580645 + 0.5) / 255.0, mask);\n" /* 255 / 31 */
     "}\n";
 
@@ -309,6 +329,8 @@ static int gles_pipelines(char *why, size_t why_size) {
         gles_tex_loc.flags = glGetAttribLocation(gles_prog_tex, "a_flags");
         gles_tex_loc.vram = glGetUniformLocation(gles_prog_tex, "u_vram");
         gles_tex_loc.set_mask = glGetUniformLocation(gles_prog_tex, "u_set_mask");
+        gles_tex_loc.semi = glGetUniformLocation(gles_prog_tex, "u_semi");
+        gles_tex_loc.check = glGetUniformLocation(gles_prog_tex, "u_check_mask");
     }
     glGenBuffers(1, &gles_vbo);
     return 1;
@@ -373,6 +395,8 @@ static void gles_flush(void) {
         glUseProgram(gles_prog_tex);
         glUniform1i(gles_tex_loc.vram, 0);
         glUniform1i(gles_tex_loc.set_mask, gles_batch_mask);
+        glUniform1i(gles_tex_loc.semi, gles_batch_semi > 0 ? gles_batch_semi : 0);
+        glUniform1i(gles_tex_loc.check, gles_batch_check);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gles_read);
     } else {
@@ -415,11 +439,16 @@ static void gles_flush(void) {
  * constant, so primitives with different ones cannot share a draw. */
 static void gles_batch_state(const GpuEvent *ev) {
     int mask = ev->set_mask ? 1 : 0;
+    int semi = ev->semi ? ev->abr + 1 : 0;
+    int check = ev->check_mask ? 1 : 0;
     int area[4] = {ev->area_x0, ev->area_y0, ev->area_x1, ev->area_y1};
 
-    if (gles_batch_mask != mask || memcmp(gles_batch_area, area, sizeof(area)) != 0) {
+    if (gles_batch_mask != mask || gles_batch_semi != semi || gles_batch_check != check ||
+        memcmp(gles_batch_area, area, sizeof(area)) != 0) {
         gles_flush();
         gles_batch_mask = mask;
+        gles_batch_semi = semi;
+        gles_batch_check = check;
         memcpy(gles_batch_area, area, sizeof(area));
         /* The drawing area is inclusive and clipped to the VRAM; empty when the corners are inverted. */
         {
@@ -645,8 +674,8 @@ static void gles_event(const GpuEvent *ev) {
             gles_ev_count[ev->kind]++; /* DW3_GLES_NOFLAT: bisecting what paints a region */
         } else if (gles_off_tex && ev->textured) {
             gles_ev_count[ev->kind]++; /* DW3_GLES_NOTEX */
-        } else if (ev->semi || ev->dither) {
-            gles_ev_count[ev->kind]++; /* semi-transparent or dithered: M4's fragment fetch and dither matrix */
+        } else if (ev->dither) {
+            gles_ev_count[ev->kind]++; /* dithered: M4b, the dither matrix */
         } else {
             gles_rect(ev);
         }
