@@ -299,17 +299,35 @@ static int state_header_check(const StateHeader *h, const char *path, char *err,
         return 0;
     }
     state_header_now(&now);
-    if (strcmp(h->game_id, now.game_id) != 0 || h->ptr_size != now.ptr_size ||
-        strncmp(h->exe_sha1, now.exe_sha1, 40) != 0) {
+    if (strcmp(h->game_id, now.game_id) != 0 || h->ptr_size != now.ptr_size) {
         snprintf(err, err_size, "%s: saved by another binary (%.32s, %u-bit, sha1 %.12s; this is %s, %u-bit, %.12s): a "
                  "state holds the binary's own addresses, only the same build can load it", path, h->game_id,
                  h->ptr_size * 8, h->exe_sha1, now.game_id, now.ptr_size * 8, now.exe_sha1);
         return 0;
     }
-    if (h->image != now.image || h->arena != now.arena || h->stack != now.stack) {
-        snprintf(err, err_size, "%s: saved with the image at another address (0x%llx, now 0x%llx; address space layout "
-                 "randomisation): its pointers do not hold in this run", path, (unsigned long long)h->image,
+    if (strncmp(h->exe_sha1, now.exe_sha1, 40) != 0 || h->image != now.image) {
+        /* DW3_STATE_ANY=1: take a state from another build of the same game, for measuring a renderer change without
+         * replaying the game to the same scene first (a battle state costs ~7 minutes to make). Sound only when the
+         * change cannot move the game's own writable memory - a renderer, a timer - and never for play: the state holds
+         * the binary's addresses, so a change that moved the game's data would read another build's layouts. The arena
+         * and the game stack are checked below, and that is where the game's own state lives. */
+        const char *any = getenv("DW3_STATE_ANY");
+
+        if (any == NULL || any[0] != '1') {
+            snprintf(err, err_size, "%s: saved by another binary (%.32s, %u-bit, sha1 %.12s, image 0x%llx; this is %s, "
+                     "%u-bit, sha1 %.12s, image 0x%llx): a state holds the binary's own addresses, only the same build "
+                     "can load it", path, h->game_id, h->ptr_size * 8, h->exe_sha1, (unsigned long long)h->image,
+                     now.game_id, now.ptr_size * 8, now.exe_sha1, (unsigned long long)now.image);
+            return 0;
+        }
+        port_log("state: %s was saved by sha1 %.12s with the image at 0x%llx; this is %.12s at 0x%llx, and "
+                 "DW3_STATE_ANY takes it anyway", path, h->exe_sha1, (unsigned long long)h->image, now.exe_sha1,
                  (unsigned long long)now.image);
+    }
+    if (h->arena != now.arena || h->stack != now.stack) {
+        snprintf(err, err_size, "%s: saved with the arena or the game stack at another address (0x%llx, 0x%llx; now "
+                 "0x%llx, 0x%llx): its pointers do not hold in this run", path, (unsigned long long)h->arena,
+                 (unsigned long long)h->stack, (unsigned long long)now.arena, (unsigned long long)now.stack);
         return 0;
     }
     if (h->rate != now.rate) {

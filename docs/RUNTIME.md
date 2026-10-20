@@ -323,6 +323,10 @@ and a later run of **the same binary** going on from it.
   game stack; the rate (`--refresh`). Anything else is refused with a message and status 1. The disc, the memory cards,
   `--cd-speed`, the window and the renderer are the loading run's: a state is not tied to them (the CD timing of a
   read in progress follows the loading run's `--cd-speed`).
+  `DW3_STATE_ANY=1` lifts the binary and image check, for measuring a change that cannot move the game's data (a
+  renderer, a timer) without replaying the game to the same scene: a battle state costs minutes to make. The arena and
+  the stack are still checked. It is a measurement switch, not a way to run: a state loaded this way can hang or
+  misbehave without saying so, which is what happened the first time it was tried.
 - **Through the debug channel:** `save_state` and `load_state` (docs/PORT.md "Debug channel and the MCP server"; the MCP
   tools `state_save` and `state_load`): the same files.
 - **The cost** (the first game, its first battle): about 8 MB, saved or loaded in under 0.1 s; the sanitizer build's
