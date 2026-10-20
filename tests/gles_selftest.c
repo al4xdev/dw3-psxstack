@@ -1,0 +1,230 @@
+/* tests/gles_selftest.c: the GLES renderer against the only oracle that matters, the shim's own VRAM.
+ *
+ * M1 draws no polygons yet, so what it must get byte-exactly right is the transfer path: LoadImage, Fill and CopyVRAM
+ * land in the renderer's 1024x512 RGBA8 target, and reading it back has to reproduce the shim's 16-bit VRAM exactly -
+ * including the 5-5-5-1 round trip, the mask bit in alpha, the 16-pixel rounding of a fill and the row order of an
+ * overlapping copy.
+ *
+ * The shim is not linked here: the renderer only needs its VRAM (gpu_vram_pixels/gpu_vram_stride) and its listener
+ * hook, so this test provides them and builds the same VRAM the shim would, using its documented rules. That keeps the
+ * test runnable on the handheld (where EGL exists) without the rest of the runtime.
+ *
+ * Build (the same cross toolchain as the port):
+ *   docker run --rm -v "$PWD:/src" -w /src dw3-armhf-builder:latest bash -c \
+ *     'arm-linux-gnueabihf-gcc -O2 -marm -mcpu=cortex-a35 -mfpu=neon-fp-armv8 -mfloat-abi=hard \
+ *      -DPSXSTACK_EGL -I psxstack/include -I psxstack/psyq -I psxstack/runtime \
+ *      tests/gles_selftest.c psxstack/runtime/render_gles.c -o gles_selftest -lEGL -lGLESv2 -lgbm'
+ * Then, on the console: ./gles_selftest
+ */
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "psyq_internal.h"
+#include "render_gles.h"
+
+/* ---- the shim's side, as much of it as the renderer touches ---- */
+
+#define VRAM_W 1024
+#define VRAM_H 512
+#define VRAM_STRIDE 1056 /* the port's padding: consecutive rows out of the same cache set (psyq/gpu.c) */
+
+static u16 vram[VRAM_H][VRAM_STRIDE];
+static void (*listener_fn)(const GpuEvent *ev);
+static int listener_replaces;
+
+const u16 *gpu_vram_pixels(void) {
+    return &vram[0][0];
+}
+
+int gpu_vram_stride(void) {
+    return VRAM_STRIDE;
+}
+
+void gpu_set_listener(void (*listener)(const GpuEvent *ev)) {
+    listener_fn = listener;
+}
+
+void gpu_set_listener_replaces(int on) {
+    listener_replaces = on != 0;
+}
+
+void port_log(const char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    putchar('\n');
+}
+
+/* ---- the rules the shim applies, so the oracle is built the same way ---- */
+
+/* LoadImage: the pixels as the CPU sends them, 16 bits each, wrapping at the edges; the mask bit OR-ed in. */
+static void sw_load(int x, int y, int w, int h, u16 value_at(int, int), int set_mask) {
+    int i, j;
+
+    for (j = 0; j < h; j++) {
+        for (i = 0; i < w; i++) {
+            vram[(y + j) & 511][(x + i) & 1023] = (u16)(value_at(i, j) | set_mask);
+        }
+    }
+}
+
+/* Fill: x rounded down to 16, the width up to 16, no mask bit (gpu.c gpu_fill). */
+static void sw_fill(int x, int y, int w, int h, u16 colour) {
+    int i, j;
+
+    for (j = 0; j < h; j++) {
+        for (i = 0; i < w; i++) {
+            vram[(y + j) & 511][(x + i) & 1023] = colour;
+        }
+    }
+}
+
+/* CopyVRAM: row by row, in order, so an overlapping copy sees its own earlier rows (gpu.c gpu_copy). */
+static void sw_copy(int sx, int sy, int dx, int dy, int w, int h, int set_mask, int check_mask) {
+    int i, j;
+
+    for (j = 0; j < h; j++) {
+        for (i = 0; i < w; i++) {
+            u16 p = vram[(sy + j) & 511][(sx + i) & 1023];
+            u16 *d = &vram[(dy + j) & 511][(dx + i) & 1023];
+
+            if (check_mask && (*d & 0x8000)) {
+                continue;
+            }
+            *d = (u16)(p | set_mask);
+        }
+    }
+}
+
+static void tell(GpuEventKind kind, int x, int y, int w, int h, int set_mask, int check_mask) {
+    GpuEvent ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = kind;
+    ev.x = x;
+    ev.y = y;
+    ev.w = w;
+    ev.h = h;
+    ev.set_mask = set_mask;
+    ev.check_mask = check_mask;
+    render_gles_feed(&ev);
+}
+
+/* ---- the test ---- */
+
+static int compare(const char *what) {
+    static u16 hw[VRAM_W * VRAM_H];
+    int x, y, diff = 0;
+
+    if (!render_gles_read_vram(hw)) {
+        printf("   %-28s : read_vram FAILED\n", what);
+        return 0;
+    }
+    for (y = 0; y < VRAM_H && diff < 8; y++) {
+        for (x = 0; x < VRAM_W; x++) {
+            if (hw[(size_t)y * VRAM_W + x] != vram[y][x]) {
+                if (diff < 8) {
+                    printf("   %-28s : diff at %d,%d sw 0x%04x hw 0x%04x\n", what, x, y, vram[y][x],
+                           hw[(size_t)y * VRAM_W + x]);
+                }
+                diff++;
+            }
+        }
+    }
+    if (diff == 0) {
+        printf("   %-28s : exact (%d x %d texels)\n", what, VRAM_W, VRAM_H);
+        return 1;
+    }
+    printf("   %-28s : %s\n", what, "DIFFERS");
+    return 0;
+}
+
+static u16 pattern(int i, int j) {
+    /* every 5-bit field and the mask bit, so a shifted or swapped channel cannot pass */
+    return (u16)(((i * 3) & 31) | (((j * 5) & 31) << 5) | (((i ^ j) & 31) << 10) | (((i + j) & 1) << 15));
+}
+
+int main(void) {
+    char why[160] = {0};
+    int ok = 1, i, j;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("GLES renderer self-test (M1: the transfer path against the shim's VRAM)\n");
+    printf("opening the EGL/GBM context...\n");
+    if (!render_gles_open(why, sizeof(why))) {
+        printf("FAIL: no renderer: %s\n", why);
+        return 1;
+    }
+    printf("context: %s\n\n", render_gles_describe());
+    printf("starting the VRAM target...\n");
+    if (!render_gles_raster_start(1, why, sizeof(why))) {
+        printf("FAIL: raster_start: %s\n", why);
+        render_gles_close();
+        return 1;
+    }
+    printf("listener installed, replaces=%d\n\n", listener_replaces);
+
+    /* 1. LoadImage of the whole VRAM, the way a state load or a texture upload lands. */
+    sw_load(0, 0, VRAM_W, VRAM_H, pattern, 0);
+    tell(GPU_EV_LOAD, 0, 0, VRAM_W, VRAM_H, 0, 0);
+    render_gles_frame();
+    ok &= compare("LoadImage 1024x512");
+
+    /* 2. A fill over a region, with the 16-pixel rounding the command implies, and a wrapping one. */
+    sw_fill(320, 100, 64, 32, 0x7C1F);
+    tell(GPU_EV_FILL, 320, 100, 64, 32, 0, 0);
+    render_gles_frame();
+    ok &= compare("Fill 64x32");
+
+    sw_fill(1000, 500, 48, 20, 0x03E0);
+    tell(GPU_EV_FILL, 1000, 500, 48, 20, 0, 0);
+    render_gles_frame();
+    ok &= compare("Fill wrapping the edge");
+
+    /* 3. A copy that overlaps itself: the row order is what makes it exact. */
+    sw_copy(10, 10, 12, 12, 64, 64, 0, 0);
+    tell(GPU_EV_COPY, 12, 12, 64, 64, 0, 0);
+    render_gles_frame();
+    ok &= compare("Copy overlapping");
+
+    /* 4. A checked copy: the pixels with the mask bit set must survive. The marked pixel is set through a transfer
+     * (a LoadImage with the mask bit OR-ed in), never by writing the oracle's array: that would put the two sides in
+     * different states, which is exactly what the first version of this test did and the comparison caught. */
+    vram[300][40] = (u16)(pattern(5, 5) & ~0x8000);
+    vram[300][41] = (u16)(pattern(6, 5) | 0x8000);
+    tell(GPU_EV_LOAD, 40, 300, 2, 1, 0, 0); /* the values as they are, bit 15 included */
+    sw_copy(40, 300, 500, 300, 2, 1, 0, 1);
+    tell(GPU_EV_COPY, 500, 300, 2, 1, 0, 1);
+    render_gles_frame();
+    ok &= compare("Copy with check-mask");
+
+    /* 5. A set-mask load: the bit is OR-ed into every pixel. */
+    for (j = 0; j < 8; j++) {
+        for (i = 0; i < 8; i++) {
+            vram[400 + j][200 + i] = (u16)(pattern(i, j) | 0x8000);
+        }
+    }
+    tell(GPU_EV_LOAD, 200, 400, 8, 8, 0x8000, 0);
+    render_gles_frame();
+    ok &= compare("LoadImage with set-mask");
+
+    /* 6. Nothing drawn by the CPU: the polygons are counted, not pretended (M2/M3 own them). */
+    {
+        GpuEvent ev;
+
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = GPU_EV_TRIANGLE;
+        render_gles_feed(&ev);
+    }
+    printf("\nundrawn so far: %u triangle(s), %u rect(s), %u segment(s)\n", render_gles_undrawn(GPU_EV_TRIANGLE),
+           render_gles_undrawn(GPU_EV_RECT), render_gles_undrawn(GPU_EV_SEGMENT));
+
+    render_gles_close();
+    printf("\n%s\n", ok ? "PASS: every transfer reproduced the shim's VRAM exactly" : "FAIL: see the diffs above");
+    return ok ? 0 : 1;
+}

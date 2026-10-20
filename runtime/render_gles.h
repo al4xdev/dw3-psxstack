@@ -30,6 +30,9 @@ int render_gles_read_vram(unsigned short *out);
 /* The events the listener could not draw yet, by GpuEventKind (0 triangle, 1 rect, 2 segment): M1 reports what is left
  * instead of pretending, so a test can assert the transfers match and print the rest as coverage. */
 unsigned render_gles_undrawn(int kind);
+/* The listener's entry point, the same function gpu.c calls: a test can feed a transfer sequence without the shim
+ * (tests/gles_selftest.c). Ignored unless rasterising. */
+void render_gles_feed(const void *ev);
 void render_gles_close(void);
 #endif
 

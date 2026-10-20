@@ -56,41 +56,8 @@ static int gles_open;
 static int gles_rasterising;
 static char gles_what[96];
 
-/* The dirty rectangle of transfers since the last frame, as half-open bounds; empty when x1 <= x0. */
-static int gles_dirty[4];
 /* What the listener was asked to draw but cannot yet: the M2/M3/M4 work, counted so a test can report it. */
 static unsigned gles_ev_count[8];
-
-static void gles_dirty_reset(void) {
-    /* x1 <= x0 is the empty rectangle. */
-    gles_dirty[0] = gles_dirty[2] = VRAM_W;
-    gles_dirty[1] = gles_dirty[3] = 0;
-}
-
-static void gles_dirty_add(int x, int y, int w, int h) {
-    if (w <= 0 || h <= 0) {
-        return;
-    }
-    if (gles_dirty[0] >= gles_dirty[2]) {
-        gles_dirty[0] = x;
-        gles_dirty[1] = y;
-        gles_dirty[2] = x + w;
-        gles_dirty[3] = y + h;
-        return;
-    }
-    if (x < gles_dirty[0]) {
-        gles_dirty[0] = x;
-    }
-    if (y < gles_dirty[1]) {
-        gles_dirty[1] = y;
-    }
-    if (x + w > gles_dirty[2]) {
-        gles_dirty[2] = x + w;
-    }
-    if (y + h > gles_dirty[3]) {
-        gles_dirty[3] = y + h;
-    }
-}
 
 /* 5-5-5-1 to 8-8-8-8, the packing the target holds: r, g, b scaled from 5 bits, alpha the mask bit. Scaled by 255/31
  * with rounding, which is what makes the round trip exact (docs/gpu/02). */
@@ -131,8 +98,51 @@ static int gles_upload_rect(int x, int y, int w, int h) {
     return 1;
 }
 
-/* The listener: gpu.c calls this instead of rasterising (gpu_set_listener_replaces). The transfers land in the dirty
- * rectangle; everything else is counted until its milestone exists. */
+/* A transfer writes its rectangle with every pixel's coordinates masked to the VRAM's edges (gpu.c's gpu_fill,
+ * gpu_copy and gpu_load_pixel all do `& 1023` / `& 511`), so a rectangle that runs past an edge lands wrapped. The
+ * upload has to split it the same way: one glTexSubImage2D cannot write outside the texture. At most four pieces. */
+static void gles_upload_wrapped(int x, int y, int w, int h) {
+    int x0[2], x1[2], y0[2], y1[2];
+    int nx = 0, ny = 0, i, j;
+
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    x &= 1023;
+    y &= 511;
+    x0[nx] = x;
+    x1[nx] = x + w > VRAM_W ? VRAM_W : x + w;
+    nx++;
+    if (x + w > VRAM_W) {
+        x0[nx] = 0;
+        x1[nx] = (x + w) & 1023;
+        if (x1[nx] == 0) {
+            x1[nx] = VRAM_W; /* an exact multiple wrapped onto the start: the whole row */
+        }
+        nx++;
+    }
+    y0[ny] = y;
+    y1[ny] = y + h > VRAM_H ? VRAM_H : y + h;
+    ny++;
+    if (y + h > VRAM_H) {
+        y0[ny] = 0;
+        y1[ny] = (y + h) & 511;
+        if (y1[ny] == 0) {
+            y1[ny] = VRAM_H;
+        }
+        ny++;
+    }
+    for (j = 0; j < ny; j++) {
+        for (i = 0; i < nx; i++) {
+            /* The source coordinates come from the start of the write, which is what the shim's own loop walks. */
+            gles_upload_rect(x0[i], y0[j], x1[i] - x0[i], y1[j] - y0[j]);
+        }
+    }
+}
+
+/* The listener: gpu.c calls this instead of rasterising (gpu_set_listener_replaces). The transfers are uploaded at
+ * once, in order, so they interleave with the drawing that follows; everything else is counted until its milestone
+ * exists. */
 static void gles_event(const GpuEvent *ev) {
     if (!gles_rasterising) {
         return;
@@ -143,10 +153,10 @@ static void gles_event(const GpuEvent *ev) {
     case GPU_EV_COPY:
         /* One upload per transfer: the shim's VRAM already holds the result, including the wrap-around, the mask rules
          * and the row order of an overlapping copy, so the target cannot disagree with it. */
-        gles_dirty_add(ev->x, ev->y, ev->w, ev->h);
+        gles_upload_wrapped(ev->x, ev->y, ev->w, ev->h);
         break;
     case GPU_EV_POWER_ON:
-        gles_dirty_add(0, 0, VRAM_W, VRAM_H);
+        gles_upload_rect(0, 0, VRAM_W, VRAM_H);
         break;
     case GPU_EV_TRIANGLE:
     case GPU_EV_RECT:
@@ -240,7 +250,6 @@ int render_gles_open(char *why, size_t why_size) {
     snprintf(gles_what, sizeof(gles_what), "EGL %d.%d, %s, %s", major, minor, renderer != NULL ? renderer : "?",
              version != NULL ? version : "?");
     gles_open = 1;
-    gles_dirty_reset();
     return 1;
 
 fail:
@@ -290,7 +299,7 @@ int render_gles_raster_start(int scale, char *why, size_t why_size) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gles_read, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
     /* The target starts as the VRAM is now (the shim's power-on state or a loaded state). */
-    gles_dirty_add(0, 0, VRAM_W, VRAM_H);
+    gles_upload_rect(0, 0, VRAM_W, VRAM_H);
     gles_rasterising = 1;
     gpu_set_listener(gles_event);
     gpu_set_listener_replaces(1);
@@ -301,20 +310,9 @@ int render_gles_rasterising(void) {
     return gles_rasterising;
 }
 
-/* Once per vsync, before the present: the rectangles the transfers touched go up in one glTexSubImage2D each, which is
- * what makes the target agree with the shim's VRAM without the CPU rasterising anything. */
+/* Once per vsync. The transfers upload as they happen, so nothing is pending here yet; this is where the batch
+ * flush, the read copy (blit of the dirty rectangle) and the display pass land as M2 and M3 arrive. */
 void render_gles_frame(void) {
-    if (!gles_rasterising) {
-        return;
-    }
-    if (gles_dirty[0] >= gles_dirty[2]) {
-        return;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
-    if (!gles_upload_rect(gles_dirty[0], gles_dirty[1], gles_dirty[2] - gles_dirty[0], gles_dirty[3] - gles_dirty[1])) {
-        port_log("gles: out of memory uploading the VRAM rectangle");
-    }
-    gles_dirty_reset();
 }
 
 /* The whole target back as the shim's 16-bit pixels: the exactness test's comparison (and, later, the checkpoint).
@@ -349,6 +347,10 @@ int render_gles_read_vram(u16 *out) {
 /* The events the listener could not draw yet, by GpuEventKind: M1 reports them instead of pretending. */
 unsigned render_gles_undrawn(int kind) {
     return (kind >= 0 && kind < 8) ? gles_ev_count[kind] : 0;
+}
+
+void render_gles_feed(const void *ev) {
+    gles_event((const GpuEvent *)ev);
 }
 
 void render_gles_close(void) {
