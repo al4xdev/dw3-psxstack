@@ -326,9 +326,20 @@ static void gles_read_sync(void) {
     if (w <= 0 || h <= 0) {
         return;
     }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, gles_fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gles_read_fbo);
-    glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    /* glBlitFramebuffer is subject to the scissor, and the scissor is the PS1 drawing area - during a title screen
+     * that is 0,0..319,239. Leaving it on copied only the display area into the read texture and none of the texture
+     * pages (the title's are at x = 640), so every sprite sampled zeros, discarded itself and drew nothing. */
+    {
+        GLboolean scissor_on = glIsEnabled(GL_SCISSOR_TEST);
+
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, gles_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gles_read_fbo);
+        glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if (scissor_on) {
+            glEnable(GL_SCISSOR_TEST);
+        }
+    }
     gles_drawn[0] = gles_drawn[2] = VRAM_W;
     gles_drawn[1] = gles_drawn[3] = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
@@ -806,8 +817,10 @@ int render_gles_raster_start(int scale, char *why, size_t why_size) {
     }
     gles_batch_n = 0;
     gles_batch_textured = 0;
-    gles_drawn[0] = gles_drawn[2] = VRAM_W;
-    gles_drawn[1] = gles_drawn[3] = 0;
+    /* The upload above is what the read copy has to catch up with before the first textured batch: resetting this
+     * rectangle to empty here left the read texture all zeros, so every sprite sampled texel 0x0000, discarded itself
+     * and drew nothing - the title screen came out as its background colour, with no error anywhere. */
+    gles_draw_add(0, 0, VRAM_W, VRAM_H);
     gles_batch_mask = -1;
     gles_batch_area[0] = gles_batch_area[1] = gles_batch_area[2] = gles_batch_area[3] = -1;
     gles_rasterising = 1;
