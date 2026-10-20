@@ -36,8 +36,9 @@ int Fbdev_PresentNative(FbdevPresent *fb, const uint32_t *pixels, int stride, in
 
 /* Expand a PS1 display rectangle straight into the framebuffer at integer 2x.
  * 15-bit: one VRAM pixel per screen pixel. 24-bit: 3 bytes (R,G,B) per screen pixel.
- * VRAM is 1024x512 of u16, row-major. Returns 0 when it drew, -1 when the caller should use Fbdev_Present
- * (not XRGB8888, not a 2x fit, or the rectangle wraps). */
-int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int w, int h, int rgb24);
+ * VRAM is 1024x512 of u16, row-major, `stride` pixels per row (psyq_gpu_vram_stride: 1024 visible plus padding).
+ * Returns 0 when it drew, -1 when the caller should use Fbdev_Present (not XRGB8888, not a 2x fit, or the
+ * rectangle wraps). */
+int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int stride, int x, int y, int w, int h, int rgb24);
 
 #endif

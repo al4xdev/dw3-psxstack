@@ -244,7 +244,7 @@ static void sync_vram(int x0, int y0, int w, int h) {
             run->h = 1;
             run->offset = r.nstaging;
         }
-        staging_add(vram + y * VRAM_W + lo * 64, (size_t)(hi - lo + 1) * 64 * 2);
+        staging_add(vram + y * psyq_gpu_vram_stride() + lo * 64, (size_t)(hi - lo + 1) * 64 * 2);
     }
 }
 

@@ -113,7 +113,7 @@ static void tex_hash_row(PortSha1 *c, const u16 *vram, int x, int y, int w) {
     u8 buf[2 * VRAM_W];
     int i;
     for (i = 0; i < w; i++) {
-        u16 p = vram[(y & 511) * VRAM_W + ((x + i) & 1023)];
+        u16 p = vram[(y & 511) * psyq_gpu_vram_stride() + ((x + i) & 1023)];
         buf[2 * i] = (u8)p;
         buf[2 * i + 1] = (u8)(p >> 8);
     }
@@ -361,7 +361,7 @@ static void dump_write(const TexEntry *e, const GpuEvent *ev, const TexImage *im
             return;
         }
         for (x = 0; x < n; x++) {
-            pal[x] = tex_color(vram[ev->clut_y * VRAM_W + ((ev->clut_x + x) & 1023)]);
+            pal[x] = tex_color(vram[ev->clut_y * psyq_gpu_vram_stride() + ((ev->clut_x + x) & 1023)]);
         }
         SDL_SetPaletteColors(p, pal, 0, n);
         for (y = 0; y < k->h; y++) {
@@ -581,7 +581,7 @@ static u64 clut_hash(int x, int y, int n) {
     {
         u8 buf[512];
         for (i = 0; i < n; i++) {
-            u16 p = vram[y * VRAM_W + ((x + i) & 1023)];
+            u16 p = vram[y * psyq_gpu_vram_stride() + ((x + i) & 1023)];
             buf[2 * i] = (u8)p;
             buf[2 * i + 1] = (u8)(p >> 8);
         }
@@ -726,7 +726,7 @@ void render_gpu_tex_event(const GpuEvent *ev) {
             for (j = 0; j < h; j++) {
                 int i;
                 for (i = 0; i < w; i++) {
-                    img->pixels[j * w + i] = vram[((l->y + j) & 511) * VRAM_W + ((l->x + i) & 1023)];
+                    img->pixels[j * w + i] = vram[((l->y + j) & 511) * psyq_gpu_vram_stride() + ((l->x + i) & 1023)];
                 }
             }
         }

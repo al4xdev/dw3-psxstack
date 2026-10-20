@@ -304,6 +304,10 @@ const u16 *psyq_gpu_vram(void) {
     return gpu_vram_pixels();
 }
 
+int psyq_gpu_vram_stride(void) {
+    return gpu_vram_stride();
+}
+
 void psyq_gpu_display(PsyqDisplay *out) {
     *out = psyq_gpu_disp;
 }

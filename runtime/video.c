@@ -126,7 +126,7 @@ static void video_convert(void) {
         return;
     }
     for (y = 0; y < h; y++) {
-        const u16 *row = vram + (size_t)((d.y + y) & 511) * 1024;
+        const u16 *row = vram + (size_t)((d.y + y) & 511) * psyq_gpu_vram_stride();
         u32 *out = video_pixels + (size_t)y * w;
         if (d.rgb24) {
             int bx = (d.x & 1023) * 2;
@@ -509,7 +509,7 @@ static void video_gpu_shots_due(void) {
 static void video_vram_check(void) {
     static u16 hw[1024 * 512];
     const u16 *sw = psyq_gpu_vram();
-    int i, n = 0, first = -1;
+    int x, y, n = 0, first = -1;
     if (video_check_every < 0) {
         const char *env = getenv(PSXSTACK_GAME_ENV_PREFIX "_PORT_GPU_VRAM_CHECK");
         video_check_every = env != NULL ? strtol(env, NULL, 0) : 0;
@@ -519,16 +519,24 @@ static void video_vram_check(void) {
         return;
     }
     video_checks++;
-    for (i = 0; i < 1024 * 512; i++) {
-        if (hw[i] != sw[i]) {
-            first = first < 0 ? i : first;
-            n++;
+    /* The software VRAM's rows are padded (psyq_gpu_vram_stride); the rasteriser's are 1024 apart. */
+    for (y = 0; y < 512; y++) {
+        const u16 *row = sw + (size_t)y * psyq_gpu_vram_stride();
+
+        for (x = 0; x < 1024; x++) {
+            if (hw[y * 1024 + x] != row[x]) {
+                if (first < 0) {
+                    first = y * 1024 + x;
+                }
+                n++;
+            }
         }
     }
     if (n > 0) {
         video_checks_failed++;
         port_log("gpu vram check: frame %ld: %d pixels differ, the first at %d,%d (software %04x, gpu %04x)",
-                 port_frames, n, first % 1024, first / 1024, sw[first], hw[first]);
+                 port_frames, n, first % 1024, first / 1024, sw[(first / 1024) * psyq_gpu_vram_stride() + first % 1024],
+                 hw[first]);
     }
 }
 
@@ -897,7 +905,7 @@ static int video_present_direct(long long *t0) {
     if (!d.enabled || d.w <= 0 || d.h <= 0) {
         return 0;
     }
-    if (Fbdev_PresentVram(&fbdev, psyq_gpu_vram(), d.x, d.y, d.w, d.h, d.rgb24) != 0) {
+    if (Fbdev_PresentVram(&fbdev, psyq_gpu_vram(), psyq_gpu_vram_stride(), d.x, d.y, d.w, d.h, d.rgb24) != 0) {
         return 0;
     }
     video_w = d.w < VIDEO_MAX_W ? d.w : VIDEO_MAX_W;

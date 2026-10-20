@@ -81,13 +81,15 @@ void psyq_gte_swc2_(void *p, int reg);
 /* gpu.c: the GPU. gpu_power_on zeroes the VRAM and resets the drawing state; gpu_reset_state resets the drawing state
  * only (GP1(00h)); gpu_gp0_write takes one GP0 word (a command, its parameters, a transfer's pixels), gpu_gp0_words a
  * run of them (a DMA packet); gpu_load_image is a whole CPU-to-VRAM transfer (LoadImage); gpu_vram_pixels is the
- * VRAM, 1024 pixels per row; gpu_draw_state the current E1/E3/E4/E5 words. */
+ * VRAM, gpu_vram_stride() pixels per row (1024 visible, plus padding: the rows are not a power of two apart, or a
+ * texture walk down v would thrash one L1 set); gpu_draw_state the current E1/E3/E4/E5 words. */
 void gpu_power_on(void);
 void gpu_reset_state(void);
 void gpu_gp0_write(u32 word);
 void gpu_gp0_words(const u32 *w, u32 n);
 void gpu_load_image(int x, int y, int w, int h, const u16 *pixels);
 const u16 *gpu_vram_pixels(void);
+int gpu_vram_stride(void);
 void gpu_draw_state(u32 *e1, u32 *e3, u32 *e4, u32 *e5);
 /* Span mix for DW3_GPU_LOG. Off unless that path is set: the checks are one load. */
 extern int port_gpu_log_on;

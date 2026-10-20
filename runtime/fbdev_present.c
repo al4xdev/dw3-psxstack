@@ -319,7 +319,7 @@ static void fb_row24_neon(const uint8_t *src, int n, uint32_t *dst, uint32_t *ds
 }
 #endif
 
-int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int w, int h, int rgb24) {
+int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int stride, int x, int y, int w, int h, int rgb24) {
     if (Fbdev_Validate(fb, NULL, 0) < 0 || !vram || w <= 0 || h <= 0) {
         return -1;
     }
@@ -330,6 +330,7 @@ int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int 
     }
 #if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
     /* The expand is the NEON one: without it video.c converts and calls Fbdev_Present. */
+    (void)stride;
     (void)x;
     (void)y;
     (void)rgb24;
@@ -362,14 +363,14 @@ int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int 
     }
     for (row = 0; row < copy_h; row++) {
         int vy = (sy + src_y_off + row) & 511;
-        const uint16_t *src = vram + (size_t)vy * 1024 + sx;
+        const uint16_t *src = vram + (size_t)vy * stride + sx;
         uint32_t *dst = (uint32_t *)(fb->pixels + (dst_y + row * scale_y) * fb->line_length) + dst_x;
         uint32_t *dst2 = scale_y == 2
                              ? (uint32_t *)(fb->pixels + (dst_y + row * 2 + 1) * fb->line_length) + dst_x
                              : NULL;
 
         if (rgb24) {
-            fb_row24_neon((const uint8_t *)(vram + (size_t)vy * 1024) + sx * 2, w, dst, dst2);
+            fb_row24_neon((const uint8_t *)(vram + (size_t)vy * stride) + sx * 2, w, dst, dst2);
         } else {
             fb_row15_neon(src, w, dst, dst2);
         }

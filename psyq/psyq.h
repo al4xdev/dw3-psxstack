@@ -74,7 +74,8 @@ u32 psyq_gpu_take_hash(u32 *count);
 extern int psyq_gpu_hash_on;
 
 /* ---- The video output (M2: T9's software GPU in libgpu.c, read by T10's window in runtime/video.c) ----
- * psyq_gpu_vram: the 1024x512 VRAM, 16-bit pixels (row-major, 1024 per row), as the GPU leaves it after every command.
+ * psyq_gpu_vram: the 1024x512 VRAM, 16-bit pixels (row-major, psyq_gpu_vram_stride per row: 1024 visible, plus a few
+ * pixels of padding so that consecutive rows do not share an L1 set), as the GPU leaves it after every command.
  * psyq_gpu_display: what the TV shows: the display area PutDispEnv set (DISPENV.disp as given: x, y in VRAM pixels,
  * w, h in screen pixels, so a 24-bit area spans w * 3 / 2 VRAM pixels), 24-bit colour, interlace, and whether
  * SetDispMask enabled it. */
@@ -85,6 +86,7 @@ typedef struct PsyqDisplay {
     int enabled;    /* SetDispMask(1) */
 } PsyqDisplay;
 const u16 *psyq_gpu_vram(void);
+int psyq_gpu_vram_stride(void);
 void psyq_gpu_display(PsyqDisplay *out);
 
 /* Sub-pixel precision (gte_shadow.c; docs/PORT.md "Sub-pixel precision"): the GTE's screen coordinates with their

@@ -441,7 +441,23 @@ static void script_dump_vram(const char *name, int first) {
     }
     snprintf(path, sizeof(path), "%s/vram_%s.bin", dir, name);
     f = fopen(path, first ? "wb" : "ab");
-    if (f == NULL || fwrite(psyq_gpu_vram(), 2, 1024 * 512, f) != 1024 * 512 || fclose(f) != 0) {
+    if (f == NULL) {
+        port_fatal("script: " PSXSTACK_GAME_ENV_PREFIX "_PORT_CHECKPOINT_DIR: cannot write %s", path);
+    }
+    /* Row by row: the VRAM's rows are padded (psyq_gpu_vram_stride), the checkpoint file's are 1024 apart. */
+    {
+        int row;
+
+        for (row = 0; row < 512; row++) {
+            const u16 *src = psyq_gpu_vram() + (size_t)row * psyq_gpu_vram_stride();
+
+            if (fwrite(src, 2, 1024, f) != 1024) {
+                fclose(f);
+                port_fatal("script: " PSXSTACK_GAME_ENV_PREFIX "_PORT_CHECKPOINT_DIR: cannot write %s", path);
+            }
+        }
+    }
+    if (fclose(f) != 0) {
         port_fatal("script: " PSXSTACK_GAME_ENV_PREFIX "_PORT_CHECKPOINT_DIR: cannot write %s", path);
     }
 }
