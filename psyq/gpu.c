@@ -19,8 +19,14 @@
  * pixel is drawn; the decoded segments below only remember what decoding would give again), GPUSTAT,
  * VRAM-to-CPU transfers (the game never reads VRAM back), the interlaced field skip of `dfe` (only interlaced
  * 480-line drawing would see it; the game's 480-line screens are MDEC frames loaded with LoadImage). */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 #include "psyq_internal.h"
 #include "psxstack/phase.h"
@@ -570,15 +576,100 @@ GPU_INLINE void gpu_interp_step(Interp *it, int d) {
     }
 }
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+/* A span of a one-colour textured triangle whose blend is opaque: gpu_shade_flat's `blend == GPU_OPAQUE` branch,
+ * eight pixels at a time. The texels are still fetched one by one (ARMv7 has no gather); the modulation, the
+ * clamp to 31 and the packing are vector. Every value is exact 16-bit arithmetic, so the pixels are the scalar
+ * loop's. A texel of 0 leaves the destination alone, as `continue` does there. */
+GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp *iu, Interp *iv, int au, int av,
+                                   int d, int r, int gg, int b, const int depth) {
+    const u16 *clut = &gpu_vram[m->clut_y * VRAM_W];
+    const int tex_x = m->tex_x, tex_y = m->tex_y, clut_x = m->clut_x;
+    const int u_and = m->u_and, u_or = m->u_or, v_and = m->v_and, v_or = m->v_or;
+    const u16 set_mask = g.set_mask;
+    const uint16x8_t v31 = vdupq_n_u16(31);
+    const uint16x8_t vr = vdupq_n_u16((u16)r), vg = vdupq_n_u16((u16)gg), vb = vdupq_n_u16((u16)b);
+    const uint16x8_t vmask = vdupq_n_u16(set_mask);
+    const uint16x8_t vstp = vdupq_n_u16(0x8000);
+    u16 clut16[16];
+    int cached = 0;
+    int i = 0;
+
+    /* The 4-bit CLUT is sixteen entries: copied out unless this span draws into its row, which would change what
+     * the next pixel reads. A span on any other row cannot touch it. */
+    if (depth == 1 && clut_x + 16 <= VRAM_W && (y & 511) != m->clut_y) {
+        int k;
+
+        for (k = 0; k < 16; k++) {
+            clut16[k] = clut[clut_x + k];
+        }
+        cached = 1;
+    }
+    for (; i + 8 <= n; i += 8) {
+        u16 t[8];
+        int last_v = -1;
+        const u16 *row = NULL;
+        uint16x8_t tt, tr, tg, tb, fr, fg, fb, out, zero, dq;
+        int k;
+
+        for (k = 0; k < 8; k++) {
+            int u = ((au + iu->q) & u_and) | u_or, v = ((av + iv->q) & v_and) | v_or;
+
+            if (v != last_v) {
+                row = &gpu_vram[((tex_y + v) & 511) * VRAM_W];
+                last_v = v;
+            }
+            if (cached) {
+                u16 px = row[(tex_x + (u >> 2)) & 1023];
+
+                t[k] = clut16[(px >> ((u & 3) * 4)) & 0xF];
+            } else {
+                t[k] = gpu_fetch(row, clut, tex_x, clut_x, u, depth);
+            }
+            gpu_interp_step(iu, d);
+            gpu_interp_step(iv, d);
+        }
+        tt = vld1q_u16(t);
+        tr = vandq_u16(tt, v31);
+        tg = vandq_u16(vshrq_n_u16(tt, 5), v31);
+        tb = vandq_u16(vshrq_n_u16(tt, 10), v31);
+        fr = vminq_u16(vshrq_n_u16(vmulq_u16(tr, vr), 7), v31);
+        fg = vminq_u16(vshrq_n_u16(vmulq_u16(tg, vg), 7), v31);
+        fb = vminq_u16(vshrq_n_u16(vmulq_u16(tb, vb), 7), v31);
+        out = vorrq_u16(vorrq_u16(fr, vshlq_n_u16(fg, 5)), vshlq_n_u16(fb, 10));
+        out = vorrq_u16(vorrq_u16(out, vandq_u16(tt, vstp)), vmask);
+        zero = vceqq_u16(tt, vdupq_n_u16(0));
+        dq = vld1q_u16(dst + i);
+        vst1q_u16(dst + i, vbslq_u16(zero, dq, out));
+    }
+    for (; i < n; i++) {
+        int u = ((au + iu->q) & u_and) | u_or, v = ((av + iv->q) & v_and) | v_or;
+        u16 t = gpu_fetch(&gpu_vram[((tex_y + v) & 511) * VRAM_W], clut, tex_x, clut_x, u, depth);
+
+        gpu_interp_step(iu, d);
+        gpu_interp_step(iv, d);
+        if (t != 0) {
+            gpu_shade_flat(&dst[i], t, r, gg, b, set_mask, 1, GPU_OPAQUE);
+        }
+    }
+}
+#endif
+
 /* A span of a one-colour triangle: n pixels from dst, texture coordinates (au, av) + the interpolators iu, iv. */
-GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int n, Interp iu, Interp iv, int au, int av, int d, int r,
-                                  int gg, int b, const int depth, const int blend) {
+GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int y, int n, Interp iu, Interp iv, int au, int av, int d,
+                                  int r, int gg, int b, const int depth, const int blend) {
     const u16 *clut = &gpu_vram[m->clut_y * VRAM_W];
     const int tex_x = m->tex_x, tex_y = m->tex_y, clut_x = m->clut_x;
     const int u_and = m->u_and, u_or = m->u_or, v_and = m->v_and, v_or = m->v_or;
     const u16 set_mask = g.set_mask;
     int i;
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (blend == GPU_OPAQUE && depth != 0) {
+        gpu_span_flat_neon(m, dst, y, n, &iu, &iv, au, av, d, r, gg, b, depth);
+        return;
+    }
+#endif
     for (i = 0; i < n; i++) {
         u16 t = 0;
 
@@ -598,6 +689,111 @@ GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int n, Interp iu, Int
 
 /* A span of a Gouraud triangle starting at (x, y): it[0..2] the colour's interpolators, it[3..4] the texture's.
  * Textured spans of the plain pipeline (not dithered, not semi-transparent) take their colour per pair of pixels. */
+/* DW3_NO_NEON_GOURAUD=1: the scalar Gouraud span (an escape hatch for a vector-path crash). */
+static int gpu_neon_gouraud_off = -1;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+/* The plain textured Gouraud span (not dithered, not semi-transparent: the battle's models), eight pixels at a
+ * time. The colours and the texels are still taken one by one (the colour interpolation is sequential and ARMv7
+ * has no gather); the modulation, the clamp and the packing are vector, exactly as gpu_span_flat_neon's. */
+GPU_INLINE void gpu_span_gouraud_neon(const Mode *m, u16 *dst, int y, int n, const Interp *it, const Vertex *a,
+                                      int d) {
+    const u16 *clut = &gpu_vram[m->clut_y * VRAM_W];
+    const int tex_x = m->tex_x, tex_y = m->tex_y, clut_x = m->clut_x;
+    const int u_and = m->u_and, u_or = m->u_or, v_and = m->v_and, v_or = m->v_or;
+    const u16 set_mask = g.set_mask;
+    const uint16x8_t v31 = vdupq_n_u16(31);
+    const uint16x8_t vmask = vdupq_n_u16(set_mask);
+    const uint16x8_t vstp = vdupq_n_u16(0x8000);
+    const int ar = a->r, ag = a->g, ab = a->b, au = a->u, av = a->v;
+    Interp ir = it[0], ig = it[1], ib = it[2], iu = it[3], iv = it[4];
+    int cr = ar, cg = ag, cb = ab;
+    u16 clut16[16];
+    int cached = 0;
+    int i = 0;
+
+    if (m->textured == 1 && clut_x + 16 <= VRAM_W && (y & 511) != m->clut_y) {
+        int k;
+
+        for (k = 0; k < 16; k++) {
+            clut16[k] = clut[clut_x + k];
+        }
+        cached = 1;
+    }
+    for (; i + 8 <= n; i += 8) {
+        u16 t[8], vr[8], vg[8], vb[8];
+        uint16x8_t tt, tr, tg, tb, fr, fg, fb, out, zero, dq;
+        int last_v = -1;
+        const u16 *row = NULL;
+        int k;
+
+        for (k = 0; k < 8; k++) {
+            int u, v;
+
+            if (((i + k) & 1) == 0) {
+                cr = ar + ir.q;
+                cg = ag + ig.q;
+                cb = ab + ib.q;
+            }
+            gpu_interp_step(&ir, d);
+            gpu_interp_step(&ig, d);
+            gpu_interp_step(&ib, d);
+            u = ((au + iu.q) & u_and) | u_or;
+            v = ((av + iv.q) & v_and) | v_or;
+            if (v != last_v) {
+                row = &gpu_vram[((tex_y + v) & 511) * VRAM_W];
+                last_v = v;
+            }
+            if (cached) {
+                u16 px = row[(tex_x + (u >> 2)) & 1023];
+
+                t[k] = clut16[(px >> ((u & 3) * 4)) & 0xF];
+            } else {
+                t[k] = gpu_fetch(row, clut, tex_x, clut_x, u, m->textured);
+            }
+            vr[k] = (u16)cr;
+            vg[k] = (u16)cg;
+            vb[k] = (u16)cb;
+            gpu_interp_step(&iu, d);
+            gpu_interp_step(&iv, d);
+        }
+        tt = vld1q_u16(t);
+        tr = vandq_u16(tt, v31);
+        tg = vandq_u16(vshrq_n_u16(tt, 5), v31);
+        tb = vandq_u16(vshrq_n_u16(tt, 10), v31);
+        fr = vminq_u16(vshrq_n_u16(vmulq_u16(tr, vld1q_u16(vr)), 7), v31);
+        fg = vminq_u16(vshrq_n_u16(vmulq_u16(tg, vld1q_u16(vg)), 7), v31);
+        fb = vminq_u16(vshrq_n_u16(vmulq_u16(tb, vld1q_u16(vb)), 7), v31);
+        out = vorrq_u16(vorrq_u16(fr, vshlq_n_u16(fg, 5)), vshlq_n_u16(fb, 10));
+        out = vorrq_u16(vorrq_u16(out, vandq_u16(tt, vstp)), vmask);
+        zero = vceqq_u16(tt, vdupq_n_u16(0));
+        dq = vld1q_u16(dst + i);
+        vst1q_u16(dst + i, vbslq_u16(zero, dq, out));
+    }
+    for (; i < n; i++) {
+        int u, v;
+        u16 t;
+
+        if ((i & 1) == 0) {
+            cr = ar + ir.q;
+            cg = ag + ig.q;
+            cb = ab + ib.q;
+        }
+        gpu_interp_step(&ir, d);
+        gpu_interp_step(&ig, d);
+        gpu_interp_step(&ib, d);
+        u = ((au + iu.q) & u_and) | u_or;
+        v = ((av + iv.q) & v_and) | v_or;
+        t = gpu_fetch(&gpu_vram[((tex_y + v) & 511) * VRAM_W], clut, tex_x, clut_x, u, m->textured);
+        gpu_interp_step(&iu, d);
+        gpu_interp_step(&iv, d);
+        if (t != 0) {
+            gpu_shade_gouraud(&dst[i], 0, t, cr, cg, cb, m->abr, set_mask, 1, 0, 0);
+        }
+    }
+}
+#endif
+
 GPU_INLINE void gpu_span_gouraud_tri(const Mode *m, u16 *dst, int x, int y, int n, const Interp *it, const Vertex *a,
                                      int d, const int depth, const int eight, const int semi) {
     const u16 *clut = &gpu_vram[m->clut_y * VRAM_W];
@@ -611,6 +807,12 @@ GPU_INLINE void gpu_span_gouraud_tri(const Mode *m, u16 *dst, int x, int y, int 
     int cr = ar, cg = ag, cb = ab;
     int i;
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (depth != 0 && !eight && !semi && !gpu_neon_gouraud_off) {
+        gpu_span_gouraud_neon(m, dst, y, n, it, a, d);
+        return;
+    }
+#endif
     for (i = 0; i < n; i++) {
         u16 t = 0;
 
@@ -667,12 +869,12 @@ GPU_INLINE void gpu_span_sprite(const Mode *m, u16 *dst, int n, const u16 *row, 
     CASE(2, GPU_COPY) CASE(2, GPU_OPAQUE) CASE(2, 0) CASE(2, 1) CASE(2, 2) CASE(2, 3)                                \
     CASE(3, GPU_COPY) CASE(3, GPU_OPAQUE) CASE(3, 0) CASE(3, 1) CASE(3, 2) CASE(3, 3)
 
-static void gpu_flat_tri(int kind, const Mode *m, u16 *dst, int n, const Interp *it, int au, int av, int d, int r,
-                         int gg, int b) {
+static void gpu_flat_tri(int kind, const Mode *m, u16 *dst, int y, int n, const Interp *it, int au, int av, int d,
+                         int r, int gg, int b) {
     switch (kind) {
 #define CASE(depth, blend)                                                                                           \
     case GPU_FLAT_KIND(depth, blend):                                                                                \
-        gpu_span_flat_tri(m, dst, n, it[3], it[4], au, av, d, r, gg, b, depth, blend);                               \
+        gpu_span_flat_tri(m, dst, y, n, it[3], it[4], au, av, d, r, gg, b, depth, blend);                           \
         return;
         GPU_FLAT_CASES(CASE)
 #undef CASE
@@ -980,7 +1182,46 @@ static void gpu_gouraud_tri(int kind, const Mode *m, u16 *dst, int x, int y, int
  * for both (the emulator draws them two at a time).
  * The edges are walked a row at a time (x = ceil(num / dy), num growing by dx per row: no division per row); each span
  * starts its attributes with one division and steps them per pixel. */
+/* Textured pixels by depth (4-bit, 8-bit, 15-bit): the span counter's companion (DW3_GPU_LOG, at the end). */
+static unsigned gpu_log_depth[3];
+static long long gpu_log_flat, gpu_log_gour; /* ns inside the span loops, flat and Gouraud */
+static long long gpu_log_tri;                /* ns inside gpu_triangle: the spans plus its setup */
+static unsigned gpu_log_spans;               /* spans (triangle rows) drawn */
+
+/* A few cycles, not a clock_gettime: this runs twice per span. The ARM virtual counter is readable from EL0 on
+ * this kernel; the frequency is calibrated against the monotonic clock once. */
+static double gpu_log_ns_per_cycle;
+
+static long long gpu_log_now(void) {
+#if defined(__arm__)
+    unsigned int lo, hi;
+    unsigned long long c;
+
+    asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    c = ((unsigned long long)hi << 32) | lo;
+    return (long long)((double)c * gpu_log_ns_per_cycle);
+#else
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+
+static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud);
+
 static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud) {
+    if (port_gpu_log_on) {
+        long long t0 = gpu_log_now();
+
+        gpu_triangle_body(m, a, b, c, gouraud);
+        gpu_log_tri += gpu_log_now() - t0;
+        return;
+    }
+    gpu_triangle_body(m, a, b, c, gouraud);
+}
+
+static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud) {
     const Vertex *v[3] = { a, b, c };
     const Vertex *t;
     const Vertex *s0 = NULL;
@@ -1106,6 +1347,9 @@ static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const 
         }
         if (nattr == 0 && !m->semi && !g.check_mask) {
             gpu_span_fill(y, xs, xe, gpu_flat_colour((u32)a->r | ((u32)a->g << 8) | ((u32)a->b << 16)));
+            if (port_gpu_log_on) {
+                port_gpu_log_span(0, xe - xs);
+            }
             goto next;
         }
         for (i = first; i < nattr; i++) {
@@ -1113,10 +1357,39 @@ static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const 
         }
         gpu_touch(y, xs, xe);
         if (!g.check_mask) {
+            if (port_gpu_log_on) {
+                int k = 1;
+
+                gpu_log_spans++;
+                if (m->textured) {
+                    k = m->semi ? 3 : 2;
+                    gpu_log_depth[m->textured - 1] += (unsigned)(xe - xs);
+                }
+                if (gouraud) {
+                    k = m->textured ? (m->semi ? 6 : 5) : 4;
+                }
+                port_gpu_log_span(k, xe - xs);
+            }
             if (gouraud) {
+                long long t0 = 0;
+
+                if (port_gpu_log_on) {
+                    t0 = gpu_log_now();
+                }
                 gpu_gouraud_tri(kind, m, &gpu_vram[y * VRAM_W + xs], xs, y, xe - xs, it, a, d2);
+                if (port_gpu_log_on) {
+                    gpu_log_gour += gpu_log_now() - t0;
+                }
             } else {
-                gpu_flat_tri(kind, m, &gpu_vram[y * VRAM_W + xs], xe - xs, it, a->u, a->v, d2, a->r, a->g, a->b);
+                long long t0 = 0;
+
+                if (port_gpu_log_on) {
+                    t0 = gpu_log_now();
+                }
+                gpu_flat_tri(kind, m, &gpu_vram[y * VRAM_W + xs], y, xe - xs, it, a->u, a->v, d2, a->r, a->g, a->b);
+                if (port_gpu_log_on) {
+                    gpu_log_flat += gpu_log_now() - t0;
+                }
             }
             goto next;
         }
@@ -1725,6 +1998,109 @@ void gpu_load_image(int x, int y, int w, int h, const u16 *pixels) {
         gpu_load_pixel(pixels[i]);
     }
     port_phase_end();
+}
+
+/* DW3_GPU_LOG: pixel mix and ordering-table time, one line a second. Off is one load per span. */
+int port_gpu_log_on;
+static unsigned gpu_log_pix[7];
+static long long gpu_log_ns, gpu_log_sec;
+static int gpu_log_frames;
+static FILE *gpu_log_file;
+
+void port_gpu_log_init(void) {
+    const char *env = getenv("DW3_GPU_LOG");
+    const char *nogour = getenv("DW3_NO_NEON_GOURAUD");
+
+    gpu_neon_gouraud_off = nogour != NULL && nogour[0] == '1';
+    if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0) {
+        return;
+    }
+    port_gpu_log_on = 1;
+#if defined(__arm__)
+    {
+        struct timespec a, b;
+        unsigned int lo, hi;
+        unsigned long long c0, c1;
+        long long ns;
+
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
+        c0 = ((unsigned long long)hi << 32) | lo;
+        do {
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            ns = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec);
+        } while (ns < 2000000);
+        asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
+        c1 = ((unsigned long long)hi << 32) | lo;
+        gpu_log_ns_per_cycle = (double)ns / (double)(c1 - c0);
+    }
+#endif
+    if (strcmp(env, "1") != 0) {
+        gpu_log_file = fopen(env, "a");
+    }
+    gpu_log_sec = 0;
+}
+
+void port_gpu_log_span(int kind, int pixels) {
+    if ((unsigned)kind < 7 && pixels > 0) {
+        gpu_log_pix[kind] += (unsigned)pixels;
+    }
+}
+
+void port_gpu_log_walk(long long ns) {
+    if (ns > 0) {
+        gpu_log_ns += ns;
+    }
+}
+
+void port_gpu_log_frame(void) {
+    struct timespec ts;
+    long long now;
+    double n;
+    int i;
+    char line[320];
+    const char *name[7] = {"fill", "flat", "ftex", "fblend", "gour", "gtex", "gblend"};
+
+    if (!port_gpu_log_on) {
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (gpu_log_sec == 0) {
+        gpu_log_sec = now;
+    }
+    gpu_log_frames++;
+    if (now - gpu_log_sec < 1000000000LL) {
+        return;
+    }
+    n = gpu_log_frames > 0 ? (double)gpu_log_frames : 1.0;
+    snprintf(line, sizeof line, "gpu: %.1f ms", (double)gpu_log_ns / n / 1e6);
+    for (i = 0; i < 7; i++) {
+        char bit[40];
+        size_t used = strlen(line);
+
+        snprintf(bit, sizeof bit, " %s %.0f", name[i], (double)gpu_log_pix[i] / n);
+        if (used + strlen(bit) < sizeof line - 1) {
+            memcpy(line + used, bit, strlen(bit) + 1);
+        }
+    }
+    snprintf(line + strlen(line), sizeof line - strlen(line),
+             " | depth4 %.0f depth8 %.0f depth15 %.0f | flat %.1f ms gour %.1f ms tri %.1f ms spans %.0f", 
+             (double)gpu_log_depth[0] / n, (double)gpu_log_depth[1] / n, (double)gpu_log_depth[2] / n,
+             (double)gpu_log_flat / n / 1e6, (double)gpu_log_gour / n / 1e6, (double)gpu_log_tri / n / 1e6,
+             (double)gpu_log_spans / n);
+    if (gpu_log_file != NULL) {
+        fprintf(gpu_log_file, "%s\n", line);
+        fflush(gpu_log_file);
+    }
+    memset(gpu_log_pix, 0, sizeof gpu_log_pix);
+    memset(gpu_log_depth, 0, sizeof gpu_log_depth);
+    gpu_log_flat = gpu_log_gour = 0;
+    gpu_log_tri = 0;
+    gpu_log_spans = 0;
+    gpu_log_ns = 0;
+    gpu_log_frames = 0;
+    gpu_log_sec = now;
 }
 
 /* A save state (psyq_internal.h): the VRAM and the drawing state (a command or transfer in progress included). On a

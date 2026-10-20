@@ -69,6 +69,9 @@ u16 psyq_pad_get(int port); /* the buttons last set (0 when none, or the port is
 /* The primitive stream recorder (LIBGPU): the FNV-1a hash of every primitive DrawOTag/ContinueDraw walked since
  * the previous call (and the number of them in *count, if not NULL), then resets both. */
 u32 psyq_gpu_take_hash(u32 *count);
+/* 0: the walk skips the hash (a run that records nothing; framelog.c). On by default, so a harness that never
+ * opens a log still gets the primitive stream. */
+extern int psyq_gpu_hash_on;
 
 /* ---- The video output (M2: T9's software GPU in libgpu.c, read by T10's window in runtime/video.c) ----
  * psyq_gpu_vram: the 1024x512 VRAM, 16-bit pixels (row-major, 1024 per row), as the GPU leaves it after every command.

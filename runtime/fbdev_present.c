@@ -315,21 +315,20 @@ static void fb_row24_neon(const uint8_t *src, int n, uint32_t *dst, uint32_t *ds
 #endif
 
 int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int w, int h, int rgb24) {
-    int sx, sy, dst_x, dst_y, row;
+    int sx, sy, dst_x, dst_y, row, copy_h, src_y_off;
     static int cleared_w, cleared_h;
 
     if (Fbdev_Validate(fb, NULL, 0) < 0 || !vram || w <= 0 || h <= 0) {
         return -1;
     }
-    if (!fb_xrgb8(fb) || w > 320 || h > 256) {
-        return -1;
-    }
-    if ((int)fb->xres < w * 2 || (int)fb->yres < h * 2) {
+    /* Same scale as Fbdev_Present: 320-wide is 2x across, a 240-line picture is 2x down, a 480-line movie is not,
+     * and a taller one (the 576-line title) is cropped to the panel. */
+    if (!fb_xrgb8(fb) || w > 320 || h > 576 || w * 2 > (int)fb->xres) {
         return -1;
     }
     sx = x & 1023;
     sy = y & 511;
-    if (sx + w > 1024 || sy + h > 512) {
+    if (sx + w > 1024) {
         return -1;
     }
     if (rgb24 && sx * 2 + w * 3 > 2048) {
@@ -340,20 +339,34 @@ int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int 
     (void)cleared_h;
     return -1;
 #else
+    int scale_y = h <= 256 ? 2 : 1;
+
     dst_x = ((int)fb->xres - w * 2) / 2;
-    dst_y = ((int)fb->yres - h * 2) / 2;
+    dst_y = ((int)fb->yres - h * scale_y) / 2;
+    src_y_off = 0;
+    if (dst_y < 0) {
+        src_y_off = (-dst_y) / scale_y;
+        dst_y = 0;
+    }
+    copy_h = h - src_y_off;
+    if (copy_h > (int)fb->yres / scale_y) {
+        copy_h = (int)fb->yres / scale_y;
+    }
     if (w != cleared_w || h != cleared_h) {
         memset(fb->pixels, 0, (size_t)fb->line_length * fb->yres);
         cleared_w = w;
         cleared_h = h;
     }
-    for (row = 0; row < h; row++) {
-        const uint16_t *src = vram + (size_t)(sy + row) * 1024 + sx;
-        uint32_t *dst = (uint32_t *)(fb->pixels + (dst_y + row * 2) * fb->line_length) + dst_x;
-        uint32_t *dst2 = (uint32_t *)(fb->pixels + (dst_y + row * 2 + 1) * fb->line_length) + dst_x;
+    for (row = 0; row < copy_h; row++) {
+        int vy = (sy + src_y_off + row) & 511;
+        const uint16_t *src = vram + (size_t)vy * 1024 + sx;
+        uint32_t *dst = (uint32_t *)(fb->pixels + (dst_y + row * scale_y) * fb->line_length) + dst_x;
+        uint32_t *dst2 = scale_y == 2
+                             ? (uint32_t *)(fb->pixels + (dst_y + row * 2 + 1) * fb->line_length) + dst_x
+                             : NULL;
 
         if (rgb24) {
-            fb_row24_neon((const uint8_t *)(vram + (size_t)(sy + row) * 1024) + sx * 2, w, dst, dst2);
+            fb_row24_neon((const uint8_t *)(vram + (size_t)vy * 1024) + sx * 2, w, dst, dst2);
         } else {
             fb_row15_neon(src, w, dst, dst2);
         }

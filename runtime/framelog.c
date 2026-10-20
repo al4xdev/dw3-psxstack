@@ -85,6 +85,10 @@ static void port_logf(const char *fmt, ...) {
 }
 
 void port_framelog_open(const char *log_path, const char *record_path) {
+    /* Nothing is written: the walk skips the per-primitive hash (psyq_gpu_hash_on, libgpu.c). */
+    if (log_path == NULL && record_path == NULL) {
+        psyq_gpu_hash_on = 0;
+    }
     if (log_path != NULL) {
         port_log_file = fopen(log_path, "wb"); /* "b": the same bytes on Windows (no CRLF) */
         if (port_log_file == NULL) {
@@ -92,6 +96,7 @@ void port_framelog_open(const char *log_path, const char *record_path) {
         }
         port_file_line_buffered(port_log_file); /* a crashed run's log ends at its last line */
         port_logf("# " PSXSTACK_GAME_ID " port frame log 1 (port/README.md)");
+        psyq_gpu_hash_on = 1;
     }
     if (record_path != NULL) {
         FILE *f = fopen(record_path, "wb"); /* fail now rather than at exit */
@@ -99,6 +104,7 @@ void port_framelog_open(const char *log_path, const char *record_path) {
             port_fatal("framelog: --record %s: cannot open", record_path);
         }
         fclose(f);
+        psyq_gpu_hash_on = 1;
         port_record_path = strdup(record_path);
         if (port_record_path == NULL) {
             port_fatal("framelog: out of memory");
@@ -110,7 +116,12 @@ void port_framelog_frame(void) {
     s32 stage = game_state_stage(), file = game_state_file();
     u32 map = (u32)game_state_map();
     u32 prims;
-    u32 hash = psyq_gpu_take_hash(&prims);
+    u32 hash;
+
+    if (port_log_file == NULL && port_record_path == NULL) {
+        return; /* nothing is written: no sample, no sequence, and the primitive hash is skipped (psyq_gpu_hash_on) */
+    }
+    hash = psyq_gpu_take_hash(&prims);
     port_logf("F %ld st %d fl %d map 0x%X prims %u hash %08x", port_frames, stage, file, map, prims, hash);
     if (!port_sampled || stage != port_last_stage || file != port_last_file) {
         *(PortOverlayStep *)port_append(&port_overlay_seq, &port_overlay_n, &port_overlay_cap,

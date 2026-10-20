@@ -9,6 +9,7 @@
  * port_tag_base + 4 * tag and follows it only inside the window. A harness's window (psyq_set_arena) holds PS1 lists
  * as they are: a tag is then a byte offset from the window's base, as on the PS1 (its port_ptr_to_u32 agrees). */
 #include <stdint.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +26,9 @@ static const u8 *psyq_gpu_lo;
 static const u8 *psyq_gpu_hi;
 static u32 psyq_gpu_hash = 0x811C9DC5u; /* FNV-1a offset basis */
 static u32 psyq_gpu_count;
+/* The primitive-stream hash is for the frame log and the replays. The runtime turns it off for a run that records
+ * nothing (framelog.c): the walk then skips psyq_gpu_hash_prim, a word loop per primitive, every frame. */
+int psyq_gpu_hash_on = 1;
 /* <PREFIX>_PORT_PRIM_DUMP=N: the words of every primitive hashed in frame N (the N-th psyq_gpu_take_hash period, counted
  * from 1 like the frame log), to stderr: to find what makes two builds' primitive hashes differ. */
 static long psyq_gpu_dump_frame = -1, psyq_gpu_frame = 1;
@@ -143,6 +147,42 @@ static void psyq_gpu_walk(const u32 *p, const char *who) {
     u32 steps = 0;
 
     psyq_gpu_window(&lo, &hi);
+    if (port_gpu_log_on) {
+        long long t0;
+        struct timespec ts;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t0 = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        for (;;) {
+            u32 tag = *p;
+            u32 len = tag >> 24;
+            u32 next = tag & 0xFFFFFF;
+            const u32 *q;
+
+            if (len != 0) {
+                if (psyq_gpu_hash_on) {
+                    psyq_gpu_hash_prim(p + 1, len);
+                }
+                gpu_gp0_words(p + 1, len);
+                prims++;
+            }
+            if (next == 0xFFFFFF) {
+                break;
+            }
+            q = (const u32 *)(lo + ((uintptr_t)next << psyq_gpu_tag_shift));
+            if ((const u8 *)q < lo || (const u8 *)q + 4 > hi) {
+                PSYQ_TRACE("%s: tag %06x at %u points outside the walkable window; stopped", who, next, PSYQ_PTR(p));
+                break;
+            }
+            if (++steps > (1u << 22)) {
+                PSYQ_TRACE("%s: more than 4M links from %u; a cycle? stopped", who, PSYQ_PTR(p));
+                break;
+            }
+            p = q;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        port_gpu_log_walk((long long)ts.tv_sec * 1000000000LL + ts.tv_nsec - t0);
+    } else
     for (;;) {
         u32 tag = *p;
         u32 len = tag >> 24;
@@ -150,7 +190,9 @@ static void psyq_gpu_walk(const u32 *p, const char *who) {
         const u32 *q;
 
         if (len != 0) {
-            psyq_gpu_hash_prim(p + 1, len);
+            if (psyq_gpu_hash_on) {
+                psyq_gpu_hash_prim(p + 1, len);
+            }
             gpu_gp0_words(p + 1, len);
             prims++;
         }

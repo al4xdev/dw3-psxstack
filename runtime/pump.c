@@ -31,6 +31,9 @@
 #include "psyq.h"
 #include "savestate.h"
 
+extern void port_gpu_log_init(void);
+extern void port_gpu_log_frame(void);
+
 long port_max_frames = 600;
 long port_frames;
 int port_watchdog_sec = 10;
@@ -46,6 +49,7 @@ static void port_pause(void);
 
 void port_pump_init(void) {
     port_phase_init();
+    port_gpu_log_init();
     psyq_set_vsync_pre_hook(port_audio_frame); /* the SPU's samples of the frame, before the game's handler */
     psyq_set_vsync_hook(port_frame);
     if (port_watchdog_sec > 0) {
@@ -93,6 +97,7 @@ static void port_frame(void) {
     }
     port_phase_begin(PORT_PHASE_PRESENT);
     port_video_frame();
+    port_gpu_log_frame();
     port_phase_end();
     port_framecsv_frame();
     if (port_max_frames > 0 && port_frames >= port_max_frames) {

@@ -89,6 +89,12 @@ void gpu_gp0_words(const u32 *w, u32 n);
 void gpu_load_image(int x, int y, int w, int h, const u16 *pixels);
 const u16 *gpu_vram_pixels(void);
 void gpu_draw_state(u32 *e1, u32 *e3, u32 *e4, u32 *e5);
+/* Span mix for DW3_GPU_LOG. Off unless that path is set: the checks are one load. */
+extern int port_gpu_log_on;
+void port_gpu_log_init(void);
+void port_gpu_log_span(int kind, int pixels); /* 0 fill, 1 flat, 2 ftex, 3 fblend, 4 gour, 5 gtex, 6 gblend */
+void port_gpu_log_walk(long long ns);
+void port_gpu_log_frame(void);
 
 /* gpu.c's decoded commands for the hardware renderer (runtime/render_gpu.c; issue #31): an optional listener, called
  * synchronously for every triangle (a quad is two: (1, 2, 3) then (0, 1, 2)), rectangle, line segment, fill, VRAM copy
