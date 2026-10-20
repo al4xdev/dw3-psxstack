@@ -1038,7 +1038,9 @@ static void video_gles_vram_check(void) {
             port_log("gles: vram check %ld (frame %ld): exact", checks, port_frames);
         } else {
             failed++;
-            if (getenv("DW3_GLES_DUMP") != NULL && failed == 1) {
+            if (getenv("DW3_GLES_DUMP") != NULL &&
+                (failed == 1 || (getenv("DW3_GLES_DUMP_FRAME") != NULL &&
+                                 atol(getenv("DW3_GLES_DUMP_FRAME")) == port_frames))) {
                 /* One dump of both sides, on the first failure: the quickest way to see what differs is to look. */
                 FILE *f = fopen("/tmp/gles_sw.bin", "wb");
                 int r;

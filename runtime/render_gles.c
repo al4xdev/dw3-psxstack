@@ -92,6 +92,52 @@ static int gles_batch_mask = -1;
 static int gles_batch_semi = -1;   /* 0 opaque, 1..4 the PS1's modes */
 static int gles_batch_gouraud;
 static int gles_batch_dither;
+
+/* Line segments. The PS1's stepping is the emulator's own (gpu_segment_walk), so the pixels are enumerated on the CPU
+ * and drawn as points with their colour - what the SDL3 renderer does too (render_gpu.c raster_segment). It is the one
+ * place where the CPU still touches pixels, and at the few hundred segments a 2D frame has it is a few thousand points,
+ * not a span loop. */
+#define GLES_POINTS_MAX 16384
+static GlesVertex gles_points[GLES_POINTS_MAX];
+static int gles_points_n;
+static int gles_points_mask;
+
+static void gles_point(void *ctx, int x, int y, int r, int g, int b) {
+    GlesVertex *v;
+
+    (void)ctx;
+    if (gles_points_n >= GLES_POINTS_MAX) {
+        return;
+    }
+    v = &gles_points[gles_points_n++];
+    memset(v, 0, sizeof(*v));
+    v->x = (float)x;
+    v->y = (float)y;
+    v->r = (float)r;
+    v->g = (float)g;
+    v->b = (float)b;
+    v->mask = gles_points_mask ? 1.0f : 0.0f;
+}
+
+static void gles_flush_points(void) {
+    GLsizei n = (GLsizei)gles_points_n;
+
+    if (n <= 0) {
+        return;
+    }
+    glUseProgram(gles_prog_flat);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(GlesVertex)), gles_points, GL_STREAM_DRAW);
+    glEnableVertexAttribArray((GLuint)gles_loc_pos);
+    glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
+    glEnableVertexAttribArray((GLuint)gles_loc_col);
+    glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(2 * sizeof(float)));
+    glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
+    glViewport(0, 0, VRAM_W, VRAM_H);
+    glDrawArrays(GL_POINTS, 0, n);
+    gles_points_n = 0;
+}
 static int gles_batch_check = -1;  /* the mask test */
 static int gles_drawn[4];          /* what the target has drawn since the read copy was last refreshed */
 static int gles_replace = 1;  /* the listener draws instead of the software rasteriser (--renderer gles) */
@@ -422,6 +468,7 @@ static void gles_flush(void) {
         gles_batch_n = 0;
         return;
     }
+    gles_flush_points(); /* the points below came earlier in the stream */
     if (textured) {
         /* The shader samples the read copy: bring it up to date before drawing into the target again. */
         gles_read_sync();
@@ -761,7 +808,13 @@ static void gles_event(const GpuEvent *ev) {
         }
         break;
     case GPU_EV_SEGMENT:
-        gles_ev_count[ev->kind]++; /* lines: the PS1's own stepping, still to come */
+        if (gles_off_flat) {
+            gles_ev_count[ev->kind]++;
+        } else {
+            gles_flush(); /* a triangle batch drawn after the line would paint over it */
+            gles_points_mask = ev->set_mask ? 1 : 0;
+            gpu_segment_walk(&ev->v[0], &ev->v[1], ev->gouraud, gles_point, NULL);
+        }
         break;
     }
 }
@@ -942,6 +995,7 @@ int render_gles_rasterising(void) {
 void render_gles_frame(void) {
     if (gles_rasterising) {
         gles_flush();
+        gles_flush_points();
     }
 }
 
