@@ -334,7 +334,18 @@ void port_audio_frame(void) {
     long long n = audio_vsync;
     int frames = (int)((n + 1) * SPU_RATE / audio_rate - n * SPU_RATE / audio_rate);
     port_phase_begin(PORT_PHASE_AUDIO);
-    spu_render(audio_buf, frames);
+    {
+        /* DW3_GPU_LOG counts the mix's share of the frame too (psyq/gpu.c). */
+        extern int port_gpu_log_on;
+        extern unsigned long long port_gpu_cycles(void);
+        extern void port_gpu_log_audio(unsigned long long cycles);
+        unsigned long long t0 = port_gpu_log_on ? port_gpu_cycles() : 0;
+
+        spu_render(audio_buf, frames);
+        if (t0 != 0) {
+            port_gpu_log_audio(port_gpu_cycles() - t0);
+        }
+    }
     port_phase_end();
     audio_vsync++;
     if (audio_wav != NULL) {

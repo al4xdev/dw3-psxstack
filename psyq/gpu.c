@@ -54,11 +54,13 @@
 /* The rows are padded: a texture walk steps down v one row per pixel, and a 1024-pixel (2048-byte) row stride is a
  * multiple of 32 cache lines, so every row lands in the same L1 set and evicts the one before it. On the handheld
  * (Cortex-A35, 32 KB 4-way L1) that made the fetch four times slower than the padded one: 119 ns per pixel against 31
- * with eight pixels of padding. The visible row is still 1024 pixels; only the addressing changes. */
-#define VRAM_PAD 8
+ * with padding. 1056 pixels (2112 bytes) is 33 cache lines: every row stays 64-byte aligned (the A35's read-allocate
+ * mode wants whole lines, and a stream of them keeps the row being drawn out of the way) and no row aliases another in
+ * a 4-way set. The visible row is still 1024 pixels; only the addressing changes. */
+#define VRAM_PAD 32
 #define VRAM_STRIDE (VRAM_W + VRAM_PAD)
 
-static u16 gpu_vram[VRAM_STRIDE * VRAM_H];
+static u16 gpu_vram[VRAM_STRIDE * VRAM_H] __attribute__((aligned(64)));
 
 /* Write stamps: every write to the VRAM stamps the 64-pixel blocks it touches with the current stamp (gpu_touch), which
  * advances whenever a texture segment is decoded (gpu_decoded): a decoded segment stays valid while none of the blocks
@@ -1295,6 +1297,7 @@ static unsigned long long gpu_log_flat, gpu_log_gour; /* cycles inside the span 
 static unsigned long long gpu_log_tri; /* cycles inside gpu_triangle: the spans plus its setup */
 static unsigned long long gpu_log_walk; /* cycles inside the order-list walk: the triangles plus the dispatch */
 static unsigned long long gpu_log_pkt; /* cycles inside gpu_gp0_write: the triangles plus every other primitive */
+static unsigned long long gpu_log_audio; /* cycles inside the SPU's per-frame mix (runtime/audio.c) */
 static unsigned long long gpu_log_row; /* cycles from a row's attribute setup to its gpu_touch, spans excluded */
 static unsigned long long gpu_log_tset; /* cycles of a triangle's setup, before its first row */
 static unsigned long long gpu_log_pre; /* cycles of a row's preamble: the edges' x, the side test, the clipping */
@@ -2211,6 +2214,11 @@ void port_gpu_log_span(int kind, int pixels) {
     }
 }
 
+/* The SPU's per-frame mix (runtime/audio.c measures it with the same clock). */
+void port_gpu_log_audio(unsigned long long cycles) {
+    gpu_log_audio += cycles;
+}
+
 void port_gpu_log_walk(unsigned long long cycles) {
     gpu_log_walk += cycles;
 }
@@ -2263,6 +2271,9 @@ void port_gpu_log_frame(void) {
              (double)gpu_log_spans / n, (double)gpu_log_neon_spans / n, (double)gpu_log_scalar_spans / n,
              (double)gpu_log_flat_opaque / n, (double)gpu_log_gour_ok / n, (double)gpu_log_alias_spans / n,
              (double)gpu_log_mask_px / n, (double)gpu_log_load_px / n);
+    /* The audio's share of the frame, in the same unit. */
+    snprintf(line + strlen(line), sizeof line - strlen(line), " | aud %.1f ms",
+             (double)gpu_log_audio * gpu_log_ns_per_cycle / n / 1e6);
     if (gpu_log_file != NULL) {
         fprintf(gpu_log_file, "%s\n", line);
         fflush(gpu_log_file);
@@ -2273,6 +2284,7 @@ void port_gpu_log_frame(void) {
     gpu_log_tri = 0;
     gpu_log_walk = 0;
     gpu_log_pkt = 0;
+    gpu_log_audio = 0;
     gpu_log_row = 0;
     gpu_log_tset = 0;
     gpu_log_mask = 0;
