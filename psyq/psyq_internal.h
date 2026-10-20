@@ -140,6 +140,11 @@ typedef struct {
     u16 color;       /* fill: the 15-bit colour */
 } GpuEvent;
 void gpu_set_listener(void (*listener)(const GpuEvent *ev));
+/* The listener draws every primitive itself: gpu.c emits the event and returns without rasterising, so the CPU's
+ * gpu_vram stops being the truth for drawn pixels and the display and the checkpoint have to come from the listener
+ * (runtime/render_gles.c). LoadImage, Fill and Copy keep writing the CPU's VRAM: it costs microseconds and it is the
+ * oracle the backend is validated against. Off by default, so an additive listener (render_gpu.c) is unaffected. */
+void gpu_set_listener_replaces(int on);
 /* A segment's pixels as gpu.c draws them (the measured stepping, the drawing area), in drawing order: for a listener,
  * from inside its call (the drawing area is the current one). */
 void gpu_segment_walk(const GpuVertex *a, const GpuVertex *b, int gouraud,

@@ -84,11 +84,19 @@ static u32 gpu_generation; /* gpu_stamp_generation: the stamps started over this
 
 /* The listener (psyq_internal.h "gpu.c's decoded commands"): the hardware renderer's, or NULL. */
 static void (*gpu_listener)(const GpuEvent *ev);
+/* Set when the listener draws every primitive itself (gpu_set_listener_replaces): the draw sites emit the event and
+ * return without rasterising. The transfers keep writing the CPU's VRAM, which costs microseconds and stays available
+ * as the oracle the backend is validated against. */
+static int gpu_listener_replaces;
 /* The host address of the word gpu_gp0_words is passing on (gpu_gp0_write's otherwise: NULL). */
 static const u32 *gpu_word_src;
 
 void gpu_set_listener(void (*listener)(const GpuEvent *ev)) {
     gpu_listener = listener;
+}
+
+void gpu_set_listener_replaces(int on) {
+    gpu_listener_replaces = on != 0;
 }
 
 const u32 *gpu_block_stamps(void) {
@@ -1465,6 +1473,9 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
         ev.v[1] = *b;
         ev.v[2] = *c;
         gpu_listener(&ev);
+        if (gpu_listener_replaces) {
+            return; /* the listener drew it (see gpu_set_listener_replaces) */
+        }
     }
     /* The planes: attribute(x, y) = attribute(a) + ((x - a.x) * n[0] + (y - a.y) * n[1]) / den; attributes 0..2
      * the colour (Gouraud), 3..4 the texture coordinates. */
@@ -1764,6 +1775,9 @@ static void gpu_rectangle(const u32 *w) {
         ev.w = width;
         ev.h = height;
         gpu_listener(&ev);
+        if (gpu_listener_replaces) {
+            return; /* the listener drew it; the CPU's VRAM is not the truth for drawn pixels any more */
+        }
     }
     xs = x0 < g.area_x0 ? g.area_x0 : x0;
     ys = y0 < g.area_y0 ? g.area_y0 : y0;
@@ -1887,6 +1901,9 @@ static void gpu_segment(const Mode *m, const Vertex *a, const Vertex *b, int gou
         ev.v[0] = *a;
         ev.v[1] = *b;
         gpu_listener(&ev);
+        if (gpu_listener_replaces) {
+            return; /* the listener drew it (see gpu_set_listener_replaces) */
+        }
     }
     gpu_segment_walk(a, b, gouraud, gpu_segment_pixel, (void *)m);
 }
