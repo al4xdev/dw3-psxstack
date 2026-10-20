@@ -81,7 +81,12 @@ typedef struct {
 #define GLES_BATCH_MAX 4096
 static GlesVertex gles_batch[GLES_BATCH_MAX];
 static int gles_batch_n;
-static GLuint gles_prog_flat, gles_prog_tex, gles_vbo;
+static GLuint gles_prog_flat, gles_prog_tex, gles_vbo, gles_vbo_points;
+/* One vertex array object per pipeline, holding the attribute setup: re-issuing the six pointers and their enables for
+ * every batch was ~14 of the ~25 API calls a batch cost, and a battle frame is ~85 batches. */
+static GLuint gles_vao_flat, gles_vao_tex, gles_vao_points;
+/* The textured program's constants as last set: -2 is "never set", so the first batch sets them all. */
+static int gles_u_mask = -2, gles_u_semi = -2, gles_u_check = -2, gles_u_gouraud = -2, gles_u_dither = -2;
 static GLint gles_loc_pos = -1, gles_loc_col = -1; /* the flat program's */
 static struct {
     GLint pos, col, uv, page, win, flags, vram, set_mask, semi, check, gouraud, dither;
@@ -101,6 +106,54 @@ static int gles_batch_dither;
 static GlesVertex gles_points[GLES_POINTS_MAX];
 static int gles_points_n;
 static int gles_points_mask;
+
+/* DW3_GLES_LOG=1: once a second, where a frame's milliseconds go. A battle frame is ~19 ms of a 20 ms budget, so "the
+ * renderer is slow" is not an instrument: the listener (vertex building), the flush (draw submission), the read copy
+ * (the blit that makes the drawn pixels sampleable) and the present (its own split, in render_gles_read_display) are
+ * timed apart, and whatever is left of the frame is the game's own CPU time. */
+static int gles_log_on = -1;
+static long long gles_t_listen, gles_t_flush, gles_t_rsync, gles_t_frame;
+static long long gles_log_sec;
+static unsigned gles_n_listen, gles_n_flush, gles_n_draw, gles_n_frame;
+
+static int gles_logging(void) {
+    if (gles_log_on < 0) {
+        const char *env = getenv("DW3_GLES_LOG");
+
+        gles_log_on = env != NULL && env[0] == '1';
+    }
+    return gles_log_on;
+}
+
+/* Called at the end of the frame, with the frame's own time already accumulated. The averages are per frame, so the
+ * listener and the flush read as shares of one frame even though they are called per primitive. */
+static void gles_log_tick(void) {
+    long long now;
+
+    if (!gles_logging()) {
+        return;
+    }
+    now = (long long)port_clock_ns();
+    if (gles_log_sec == 0) {
+        gles_log_sec = now;
+        return;
+    }
+    if (now - gles_log_sec < 1000000000LL) {
+        return;
+    }
+    if (gles_n_frame > 0) {
+        double n = (double)gles_n_frame;
+
+        port_log("gles: per frame over %u vsyncs: listener %.2f ms (%u calls), flush %.2f ms (%u flushes, %u draws), "
+                 "read copy %.2f ms, frame %.2f ms; present separate",
+                 gles_n_frame, (double)gles_t_listen / n / 1e6, gles_n_listen,
+                 (double)gles_t_flush / n / 1e6, gles_n_flush, gles_n_draw,
+                 (double)gles_t_rsync / n / 1e6, (double)gles_t_frame / n / 1e6);
+    }
+    gles_log_sec = now;
+    gles_t_listen = gles_t_flush = gles_t_rsync = gles_t_frame = 0;
+    gles_n_listen = gles_n_flush = gles_n_draw = gles_n_frame = 0;
+}
 
 static void gles_point(void *ctx, int x, int y, int r, int g, int b) {
     GlesVertex *v;
@@ -126,16 +179,13 @@ static void gles_flush_points(void) {
         return;
     }
     glUseProgram(gles_prog_flat);
-    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
+    glBindVertexArray(gles_vao_points);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo_points);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(GlesVertex)), gles_points, GL_STREAM_DRAW);
-    glEnableVertexAttribArray((GLuint)gles_loc_pos);
-    glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
-    glEnableVertexAttribArray((GLuint)gles_loc_col);
-    glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                          (void *)(2 * sizeof(float)));
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
-    glViewport(0, 0, VRAM_W, VRAM_H);
     glDrawArrays(GL_POINTS, 0, n);
+    glBindVertexArray(0);
+    gles_n_draw++;
     gles_points_n = 0;
 }
 static int gles_batch_check = -1;  /* the mask test */
@@ -416,15 +466,67 @@ static int gles_pipelines(char *why, size_t why_size) {
         gles_tex_loc.gouraud = glGetUniformLocation(gles_prog_tex, "u_gouraud");
         gles_tex_loc.dither = glGetUniformLocation(gles_prog_tex, "u_dither");
     }
+    /* The attribute setup lives in a vertex array object per pipeline, so a batch is a bind, an upload and a draw. Each
+     * batch's storage is handed out fresh by the orphaning glBufferData in the flush, not reused. */
     glGenBuffers(1, &gles_vbo);
+    glGenBuffers(1, &gles_vbo_points);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(GLES_BATCH_MAX * sizeof(GlesVertex)), NULL, GL_STREAM_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo_points);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(GLES_POINTS_MAX * sizeof(GlesVertex)), NULL, GL_STREAM_DRAW);
+
+    glGenVertexArrays(1, &gles_vao_flat);
+    glBindVertexArray(gles_vao_flat);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
+    glEnableVertexAttribArray((GLuint)gles_loc_pos);
+    glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
+    glEnableVertexAttribArray((GLuint)gles_loc_col);
+    glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(2 * sizeof(float)));
+
+    glGenVertexArrays(1, &gles_vao_tex);
+    glBindVertexArray(gles_vao_tex);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
+    glEnableVertexAttribArray((GLuint)gles_tex_loc.pos);
+    glVertexAttribPointer((GLuint)gles_tex_loc.pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
+    glEnableVertexAttribArray((GLuint)gles_tex_loc.col);
+    glVertexAttribPointer((GLuint)gles_tex_loc.col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(2 * sizeof(float)));
+    glEnableVertexAttribArray((GLuint)gles_tex_loc.uv);
+    glVertexAttribPointer((GLuint)gles_tex_loc.uv, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(6 * sizeof(float)));
+    glEnableVertexAttribArray((GLuint)gles_tex_loc.page);
+    glVertexAttribPointer((GLuint)gles_tex_loc.page, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(8 * sizeof(float)));
+    glEnableVertexAttribArray((GLuint)gles_tex_loc.win);
+    glVertexAttribPointer((GLuint)gles_tex_loc.win, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(12 * sizeof(float)));
+    glEnableVertexAttribArray((GLuint)gles_tex_loc.flags);
+    glVertexAttribPointer((GLuint)gles_tex_loc.flags, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(16 * sizeof(float)));
+
+    /* The line segments use the flat program's two attributes, with their own buffer. */
+    glGenVertexArrays(1, &gles_vao_points);
+    glBindVertexArray(gles_vao_points);
+    glBindBuffer(GL_ARRAY_BUFFER, gles_vbo_points);
+    glEnableVertexAttribArray((GLuint)gles_loc_pos);
+    glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
+    glEnableVertexAttribArray((GLuint)gles_loc_col);
+    glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                          (void *)(2 * sizeof(float)));
+    glBindVertexArray(0);
+    glActiveTexture(GL_TEXTURE0);
+    glViewport(0, 0, VRAM_W, VRAM_H);
+    glUseProgram(gles_prog_tex);
+    glUniform1i(gles_tex_loc.vram, 0); /* the sampler's unit: constant for the program's life */
+    gles_u_mask = gles_u_semi = gles_u_check = gles_u_gouraud = gles_u_dither = -2;
     return 1;
 }
 
-/* One draw call for everything accumulated. The scissor is the PS1 drawing area; the mask bit is the vertex alpha. */
 /* Copies what has been drawn since the last call into the read texture, which is what the textured shader samples: a
  * texture cannot be sampled while it is the render target (docs/gpu/02). Only the rectangle the batch covered is
  * copied, so the cost follows what was drawn, not the page's size. */
-static void gles_read_sync(void) {
+static void gles_read_blit(void) {
     int x0 = gles_drawn[0], y0 = gles_drawn[1];
     int x1 = gles_drawn[2], y1 = gles_drawn[3];
     int w = x1 - x0, h = y1 - y0;
@@ -451,6 +553,15 @@ static void gles_read_sync(void) {
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
 }
 
+static void gles_read_sync(void) {
+    long long t0 = gles_logging() ? (long long)port_clock_ns() : 0;
+
+    gles_read_blit();
+    if (t0 != 0) {
+        gles_t_rsync += (long long)port_clock_ns() - t0;
+    }
+}
+
 static void gles_draw_add(int x0, int y0, int x1, int y1) {
     if (gles_drawn[0] >= gles_drawn[2]) {
         gles_drawn[0] = x0;
@@ -465,7 +576,33 @@ static void gles_draw_add(int x0, int y0, int x1, int y1) {
     if (y1 > gles_drawn[3]) gles_drawn[3] = y1;
 }
 
-static void gles_flush(void) {
+/* Sets the textured program's constants that changed. Each one is a reason the batch flushes, so within a frame most
+ * batches repeat several, and a glUniform is a driver call. */
+static void gles_uniforms(void) {
+    if (gles_u_mask != gles_batch_mask) {
+        glUniform1i(gles_tex_loc.set_mask, gles_batch_mask);
+        gles_u_mask = gles_batch_mask;
+    }
+    if (gles_u_semi != gles_batch_semi) {
+        glUniform1i(gles_tex_loc.semi, gles_batch_semi > 0 ? gles_batch_semi : 0);
+        gles_u_semi = gles_batch_semi;
+    }
+    if (gles_u_check != gles_batch_check) {
+        glUniform1i(gles_tex_loc.check, gles_batch_check);
+        gles_u_check = gles_batch_check;
+    }
+    if (gles_u_gouraud != gles_batch_gouraud) {
+        glUniform1i(gles_tex_loc.gouraud, gles_batch_gouraud);
+        gles_u_gouraud = gles_batch_gouraud;
+    }
+    if (gles_u_dither != gles_batch_dither) {
+        glUniform1i(gles_tex_loc.dither, gles_batch_dither);
+        gles_u_dither = gles_batch_dither;
+    }
+}
+
+/* One draw call for everything accumulated. The scissor is the PS1 drawing area; the mask bit is the vertex alpha. */
+static void gles_flush_body(void) {
     GLsizei n = (GLsizei)gles_batch_n;
     int textured = gles_batch_textured;
 
@@ -475,52 +612,37 @@ static void gles_flush(void) {
     }
     gles_flush_points(); /* the points below came earlier in the stream */
     if (textured) {
-        /* The shader samples the read copy, which render_gles_frame brings up to date once per vsync. Syncing here
-         * instead - once per batch, ~110 times a battle frame - is the likely reason the battle ran at 18.7 fps against
-         * the software renderer's 34: each glBlitFramebuffer waits for the drawing before it and stalls the pipeline. */
+        /* The shader samples the read copy, which render_gles_frame brings up to date once per vsync: syncing here
+         * instead, once per batch, is what made the battle run at 18.7 fps against the software renderer's 34 (one
+         * glBlitFramebuffer per batch, each waiting for the drawing queued before it). */
         glUseProgram(gles_prog_tex);
-        glUniform1i(gles_tex_loc.vram, 0);
-        glUniform1i(gles_tex_loc.set_mask, gles_batch_mask);
-        glUniform1i(gles_tex_loc.semi, gles_batch_semi > 0 ? gles_batch_semi : 0);
-        glUniform1i(gles_tex_loc.check, gles_batch_check);
-        glUniform1i(gles_tex_loc.gouraud, gles_batch_gouraud);
-        glUniform1i(gles_tex_loc.dither, gles_batch_dither);
-        glActiveTexture(GL_TEXTURE0);
+        gles_uniforms();
         glBindTexture(GL_TEXTURE_2D, gles_read);
+        glBindVertexArray(gles_vao_tex);
     } else {
         glUseProgram(gles_prog_flat);
+        glBindVertexArray(gles_vao_flat);
     }
     glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
+    /* A glBufferData per batch, which orphans: the driver hands out fresh storage instead of making this write wait for
+     * every draw still reading the old one. A glBufferSubData into a reused buffer instead cost 60 ms a frame on a 2D
+     * scene - 105 us per draw, all of it stall. What the vertex array object saves is the attribute setup. */
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(GlesVertex)), gles_batch, GL_STREAM_DRAW);
-    if (textured) {
-        glEnableVertexAttribArray((GLuint)gles_tex_loc.pos);
-        glVertexAttribPointer((GLuint)gles_tex_loc.pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
-        glEnableVertexAttribArray((GLuint)gles_tex_loc.col);
-        glVertexAttribPointer((GLuint)gles_tex_loc.col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                              (void *)(2 * sizeof(float)));
-        glEnableVertexAttribArray((GLuint)gles_tex_loc.uv);
-        glVertexAttribPointer((GLuint)gles_tex_loc.uv, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                              (void *)(6 * sizeof(float)));
-        glEnableVertexAttribArray((GLuint)gles_tex_loc.page);
-        glVertexAttribPointer((GLuint)gles_tex_loc.page, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                              (void *)(8 * sizeof(float)));
-        glEnableVertexAttribArray((GLuint)gles_tex_loc.win);
-        glVertexAttribPointer((GLuint)gles_tex_loc.win, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                              (void *)(12 * sizeof(float)));
-        glEnableVertexAttribArray((GLuint)gles_tex_loc.flags);
-        glVertexAttribPointer((GLuint)gles_tex_loc.flags, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                              (void *)(16 * sizeof(float)));
-    } else {
-        glEnableVertexAttribArray((GLuint)gles_loc_pos);
-        glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
-        glEnableVertexAttribArray((GLuint)gles_loc_col);
-        glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                              (void *)(2 * sizeof(float)));
-    }
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
-    glViewport(0, 0, VRAM_W, VRAM_H);
     glDrawArrays(GL_TRIANGLES, 0, n);
+    glBindVertexArray(0);
+    gles_n_draw++;
     gles_batch_n = 0;
+}
+
+static void gles_flush(void) {
+    long long t0 = gles_logging() ? (long long)port_clock_ns() : 0;
+
+    gles_flush_body();
+    if (t0 != 0) {
+        gles_t_flush += (long long)port_clock_ns() - t0;
+        gles_n_flush++;
+    }
 }
 
 /* The state a batch depends on. A change flushes: the drawing area becomes a scissor and the mask flags a shader
@@ -778,7 +900,7 @@ static void gles_upload_wrapped(int x, int y, int w, int h) {
 /* The listener: gpu.c calls this instead of rasterising (gpu_set_listener_replaces). The transfers are uploaded at
  * once, in order, so they interleave with the drawing that follows; everything else is counted until its milestone
  * exists. */
-static void gles_event(const GpuEvent *ev) {
+static void gles_event_body(const GpuEvent *ev) {
     if (!gles_rasterising) {
         return;
     }
@@ -822,6 +944,16 @@ static void gles_event(const GpuEvent *ev) {
             gpu_segment_walk(&ev->v[0], &ev->v[1], ev->gouraud, gles_point, NULL);
         }
         break;
+    }
+}
+
+static void gles_event(const GpuEvent *ev) {
+    long long t0 = gles_logging() ? (long long)port_clock_ns() : 0;
+
+    gles_event_body(ev);
+    if (t0 != 0) {
+        gles_t_listen += (long long)port_clock_ns() - t0;
+        gles_n_listen++;
     }
 }
 
@@ -999,6 +1131,8 @@ int render_gles_rasterising(void) {
 /* Once per vsync. The transfers upload as they happen, so nothing is pending here yet; this is where the batch
  * flush, the read copy (blit of the dirty rectangle) and the display pass land as M2 and M3 arrive. */
 void render_gles_frame(void) {
+    long long t0 = gles_logging() ? (long long)port_clock_ns() : 0;
+
     if (!gles_rasterising) {
         return;
     }
@@ -1007,6 +1141,11 @@ void render_gles_frame(void) {
     /* Everything drawn this vsync goes into the read copy once, here: the next vsync's textured primitives sample it.
      * One blit of the rectangle that changed, instead of one per batch. */
     gles_read_sync();
+    if (t0 != 0) {
+        gles_t_frame += (long long)port_clock_ns() - t0;
+        gles_n_frame++;
+        gles_log_tick();
+    }
 }
 
 /* The display area back as 16-bit pixels, for the present that already exists (runtime/fbdev_present.c does the 2x
@@ -1135,6 +1274,22 @@ void render_gles_close(void) {
     if (gles_vbo != 0) {
         glDeleteBuffers(1, &gles_vbo);
         gles_vbo = 0;
+    }
+    if (gles_vbo_points != 0) {
+        glDeleteBuffers(1, &gles_vbo_points);
+        gles_vbo_points = 0;
+    }
+    if (gles_vao_flat != 0) {
+        glDeleteVertexArrays(1, &gles_vao_flat);
+        gles_vao_flat = 0;
+    }
+    if (gles_vao_tex != 0) {
+        glDeleteVertexArrays(1, &gles_vao_tex);
+        gles_vao_tex = 0;
+    }
+    if (gles_vao_points != 0) {
+        glDeleteVertexArrays(1, &gles_vao_points);
+        gles_vao_points = 0;
     }
     if (gles_prog_flat != 0) {
         glDeleteProgram(gles_prog_flat);
