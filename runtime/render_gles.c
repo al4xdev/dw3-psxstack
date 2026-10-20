@@ -300,7 +300,12 @@ static const char *GLES_TEX_FS =
      * is a real pixel - colour 0 with the mask bit set - and the shim draws it; testing the low 15 bits instead
      * dropped it and left the previous content there, which was the 502-pixel difference the VRAM check found. */
     "  if (depth != 3 && texel == 0u) { discard; }\n"
-    "  vec3 colour = raw ? t.rgb : floor(t.rgb * v_col.rgb / 128.0);\n"
+    /* The shim's interpolated colour is an integer at every pixel: it carries the Gouraud planes as exact rationals and
+     * takes the floor at each step (gpu.c gpu_interp_at, gpu_interp_step). Feeding the fractional value into the
+     * modulation made every model pixel one step darker than the shim's - the battle check's 4.4%, whose dominant
+     * channel delta was (-1,-1,-1) in 55% of the differing pixels. */
+    "  vec3 vc = floor(v_col.rgb);\n"
+    "  vec3 colour = raw ? t.rgb : floor(t.rgb * vc / 128.0);\n"
     "  colour = min(colour, vec3(31.0));\n"
     "  float mask = ((texel & 0x8000u) != 0u || u_set_mask != 0) ? 1.0 : 0.0;\n"
     /* The destination, through the ARM/Mali fragment-fetch extension: the mask test and the four PS1 modes, in 5-bit
@@ -316,7 +321,7 @@ static const char *GLES_TEX_FS =
     /* The dithered pipeline, in 8-bit units as the shim computes it (gpu.c gpu_pixel, m->eight): the foreground is
      * (texel * colour) >> 4, or the texel << 3 raw, or the colour itself untextured; the blend against the background
      * << 3 happens before the dither offset, and the result is cut to 5 bits at the end. */
-    "    vec3 fg8 = raw ? t.rgb * 8.0 : (depth != 3 ? floor(t.rgb * v_col.rgb / 16.0) : v_col.rgb);\n"
+    "    vec3 fg8 = raw ? t.rgb * 8.0 : (depth != 3 ? floor(t.rgb * vc / 16.0) : vc);\n"
     "    if (blend) {\n"
     "      vec3 bg8 = bg5 * 8.0;\n"
     "      if (mode == 0) { fg8 = (bg8 + fg8) * 0.5; }\n"
