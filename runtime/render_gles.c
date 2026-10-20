@@ -28,7 +28,7 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <gbm.h>
 
 #include "platform.h"
@@ -66,17 +66,28 @@ static unsigned gles_ev_count[8];
  * per call is not an option (docs/gpu/09 measures ~110 batches for ~1060 primitives per battle frame). */
 typedef struct {
     float x, y;      /* VRAM pixel coordinates */
-    float r, g, b;   /* 0..1, the flat colour */
+    float r, g, b;   /* the colour, 0..255 (what the shim's modulation multiplies by) */
     float mask;      /* 1.0 marks the pixel, 0.0 leaves it clear */
+    float u, v;      /* texture coordinates in texels, already in the page's space */
+    float page_x, page_y;      /* the texture page's corner in the VRAM */
+    float clut_x, clut_y;      /* the CLUT's first entry */
+    float win_x, win_y, win_z, win_w; /* the texture window: u_and, u_or, v_and, v_or */
+    float flags;     /* depth - 1: 0 four-bit, 1 eight-bit, 2 fifteen-bit, 3 untextured */
+    float raw;       /* 1: the texel as it is, 0: modulated by the colour */
 } GlesVertex;
 
 #define GLES_BATCH_MAX 4096
 static GlesVertex gles_batch[GLES_BATCH_MAX];
 static int gles_batch_n;
-static GLuint gles_prog_flat, gles_vbo;
-static GLint gles_loc_pos = -1, gles_loc_col = -1;
+static GLuint gles_prog_flat, gles_prog_tex, gles_vbo;
+static GLint gles_loc_pos = -1, gles_loc_col = -1; /* the flat program's */
+static struct {
+    GLint pos, col, uv, page, win, flags, vram, set_mask;
+} gles_tex_loc;
+static int gles_batch_textured; /* the kind of primitives in the batch: the two programs cannot mix */
 static int gles_batch_area[4] = {-1, -1, -1, -1};
 static int gles_batch_mask = -1;
+static int gles_drawn[4];          /* what the target has drawn since the read copy was last refreshed */
 static int gles_replace = 1; /* the listener draws instead of the software rasteriser (--renderer gles) */
 
 /* 5-5-5-1 to 8-8-8-8, the packing the target holds: r, g, b scaled from 5 bits, alpha the mask bit. Scaled by 255/31
@@ -134,7 +145,88 @@ static const char *GLES_FLAT_VS =
 static const char *GLES_FLAT_FS =
     "precision highp float;\n"
     "varying vec4 v_col;\n"
-    "void main() { gl_FragColor = v_col; }\n";
+    "void main() { gl_FragColor = vec4(v_col.rgb / 255.0, v_col.a); }\n";
+
+/* The textured shader. Written for ES 3.00 on purpose: this device gives an ES 3.2 context whatever is asked for
+ * (docs/gpu/06), and with integers the PS1's texture path becomes a transcription instead of a trick - the 4-bit and
+ * 8-bit index extraction, the texture window's (u & and) | or and the mask bit are the hardware's operations, and
+ * texelFetch removes any sampling precision doubt.
+ *
+ *   texel  = VRAM[page + windowed(u, v)]: 4-bit or 8-bit through the CLUT, or 15-bit direct
+ *   texel 0x0000 -> the pixel is not drawn (the PS1's "transparent texel")
+ *   5-bit output -> raw: the texel; else (texel * vertex colour) >> 7, clamped to 31
+ *   mask bit     -> the texel's bit 15, or 1 with set-mask
+ *
+ * The target stores 8 bits per channel, so a 5-bit value v is written as round(v * 255 / 31), which the readback maps
+ * back to exactly v (docs/gpu/02). */
+static const char *GLES_TEX_VS =
+    "#version 300 es\n"
+    "in vec2 a_pos;\n"
+    "in vec4 a_col;\n"    /* rgb 0..255, a the mask bit */
+    "in vec2 a_uv;\n"
+    "in vec4 a_page;\n"   /* page x, page y, clut x, clut y */
+    "in vec4 a_win;\n"    /* u_and, u_or, v_and, v_or */
+    "in vec2 a_flags;\n"  /* x: depth (0 4-bit, 1 8-bit, 2 15-bit, 3 untextured); y: raw */
+    "out vec4 v_col;\n"
+    "out vec2 v_uv;\n"
+    "flat out ivec4 v_page;\n"
+    "flat out ivec4 v_win;\n"
+    "flat out ivec2 v_flags;\n"
+    "void main() {\n"
+    "  v_col = a_col;\n"
+    "  v_uv = a_uv;\n"
+    "  v_page = ivec4(a_page + 0.5);\n"
+    "  v_win = ivec4(a_win + 0.5);\n"
+    "  v_flags = ivec2(a_flags + 0.5);\n"
+    "  gl_Position = vec4((a_pos.x + 0.5) / 512.0 - 1.0, (a_pos.y + 0.5) / 256.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *GLES_TEX_FS =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "uniform highp sampler2D u_vram;\n"
+    "uniform int u_set_mask;\n"
+    "in vec4 v_col;\n"
+    "in vec2 v_uv;\n"
+    "flat in ivec4 v_page;\n"
+    "flat in ivec4 v_win;\n"
+    "flat in ivec2 v_flags;\n"
+    "out vec4 o_col;\n"
+    /* one VRAM texel as the 16-bit value it holds, mask bit included */
+    "uint word(ivec2 t) {\n"
+    "  vec4 c = texelFetch(u_vram, t, 0);\n"
+    "  return uint(c.r * 31.0 + 0.5) | (uint(c.g * 31.0 + 0.5) << 5) | (uint(c.b * 31.0 + 0.5) << 10)\n"
+    "       | (c.a > 0.5 ? 0x8000u : 0u);\n"
+    "}\n"
+    "vec4 unpack5(uint v) {\n"
+    "  return vec4(float(v & 31u), float((v >> 5) & 31u), float((v >> 10) & 31u), float((v >> 15) & 1u));\n"
+    "}\n"
+    "void main() {\n"
+    "  ivec2 uv = ivec2(floor(v_uv + 0.5));\n"       /* the PS1 samples whole texels */
+    "  uv.x = (uv.x & v_win.x) | v_win.y;\n"          /* the texture window, exactly as the shim does it */
+    "  uv.y = (uv.y & v_win.z) | v_win.w;\n"
+    "  int depth = v_flags.x;\n"
+    "  bool raw = v_flags.y != 0;\n"
+    "  uint texel = 0u;\n"
+    "  if (depth == 0) {\n"
+    "    uint w = word(ivec2(v_page.x + (uv.x >> 2), v_page.y + uv.y));\n"
+    "    uint index = (w >> uint((uv.x & 3) * 4)) & 0xFu;\n"
+    "    texel = word(ivec2(v_page.z + int(index), v_page.w));\n"
+    "  } else if (depth == 1) {\n"
+    "    uint w = word(ivec2(v_page.x + (uv.x >> 1), v_page.y + uv.y));\n"
+    "    uint index = (w >> uint((uv.x & 1) * 8)) & 0xFFu;\n"
+    "    texel = word(ivec2(v_page.z + int(index), v_page.w));\n"
+    "  } else if (depth == 2) {\n"
+    "    texel = word(ivec2(v_page.x + uv.x, v_page.y + uv.y));\n"
+    "  }\n"
+    "  vec4 t = unpack5(texel);\n"
+    "  if (depth != 3 && (texel & 0x7FFFu) == 0u) { discard; }\n" /* the PS1's transparent texel */
+    "  vec3 colour = raw ? t.rgb : floor(t.rgb * v_col.rgb / 128.0);\n"
+    "  colour = min(colour, vec3(31.0));\n"
+    "  float mask = ((texel & 0x8000u) != 0u || u_set_mask != 0) ? 1.0 : 0.0;\n"
+    "  o_col = vec4(floor(colour * 8.22580645 + 0.5) / 255.0, mask);\n" /* 255 / 31 */
+    "}\n";
 
 static GLuint gles_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
@@ -177,26 +269,119 @@ static int gles_pipelines(char *why, size_t why_size) {
     }
     gles_loc_pos = glGetAttribLocation(gles_prog_flat, "a_pos");
     gles_loc_col = glGetAttribLocation(gles_prog_flat, "a_col");
+
+    {
+        GLuint tvs = gles_shader(GL_VERTEX_SHADER, GLES_TEX_VS);
+        GLuint tfs = tvs != 0 ? gles_shader(GL_FRAGMENT_SHADER, GLES_TEX_FS) : 0;
+
+        if (tfs == 0) {
+            snprintf(why, why_size, "the textured shaders did not compile");
+            return 0;
+        }
+        gles_prog_tex = glCreateProgram();
+        glAttachShader(gles_prog_tex, tvs);
+        glAttachShader(gles_prog_tex, tfs);
+        glLinkProgram(gles_prog_tex);
+        glGetProgramiv(gles_prog_tex, GL_LINK_STATUS, &ok);
+        glDeleteShader(tvs);
+        glDeleteShader(tfs);
+        if (!ok) {
+            snprintf(why, why_size, "the textured program did not link");
+            return 0;
+        }
+        gles_tex_loc.pos = glGetAttribLocation(gles_prog_tex, "a_pos");
+        gles_tex_loc.col = glGetAttribLocation(gles_prog_tex, "a_col");
+        gles_tex_loc.uv = glGetAttribLocation(gles_prog_tex, "a_uv");
+        gles_tex_loc.page = glGetAttribLocation(gles_prog_tex, "a_page");
+        gles_tex_loc.win = glGetAttribLocation(gles_prog_tex, "a_win");
+        gles_tex_loc.flags = glGetAttribLocation(gles_prog_tex, "a_flags");
+        gles_tex_loc.vram = glGetUniformLocation(gles_prog_tex, "u_vram");
+        gles_tex_loc.set_mask = glGetUniformLocation(gles_prog_tex, "u_set_mask");
+    }
     glGenBuffers(1, &gles_vbo);
     return 1;
 }
 
 /* One draw call for everything accumulated. The scissor is the PS1 drawing area; the mask bit is the vertex alpha. */
+/* Copies what has been drawn since the last call into the read texture, which is what the textured shader samples: a
+ * texture cannot be sampled while it is the render target (docs/gpu/02). Only the rectangle the batch covered is
+ * copied, so the cost follows what was drawn, not the page's size. */
+static void gles_read_sync(void) {
+    int x0 = gles_drawn[0], y0 = gles_drawn[1];
+    int x1 = gles_drawn[2], y1 = gles_drawn[3];
+    int w = x1 - x0, h = y1 - y0;
+
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gles_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gles_read_fbo);
+    glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    gles_drawn[0] = gles_drawn[2] = VRAM_W;
+    gles_drawn[1] = gles_drawn[3] = 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
+}
+
+static void gles_draw_add(int x0, int y0, int x1, int y1) {
+    if (gles_drawn[0] >= gles_drawn[2]) {
+        gles_drawn[0] = x0;
+        gles_drawn[1] = y0;
+        gles_drawn[2] = x1;
+        gles_drawn[3] = y1;
+        return;
+    }
+    if (x0 < gles_drawn[0]) gles_drawn[0] = x0;
+    if (y0 < gles_drawn[1]) gles_drawn[1] = y0;
+    if (x1 > gles_drawn[2]) gles_drawn[2] = x1;
+    if (y1 > gles_drawn[3]) gles_drawn[3] = y1;
+}
+
 static void gles_flush(void) {
     GLsizei n = (GLsizei)gles_batch_n;
+    int textured = gles_batch_textured;
 
-    if (n <= 0 || gles_prog_flat == 0) {
+    if (n <= 0) {
         gles_batch_n = 0;
         return;
     }
-    glUseProgram(gles_prog_flat);
+    if (textured) {
+        /* The shader samples the read copy: bring it up to date before drawing into the target again. */
+        gles_read_sync();
+        glUseProgram(gles_prog_tex);
+        glUniform1i(gles_tex_loc.vram, 0);
+        glUniform1i(gles_tex_loc.set_mask, gles_batch_mask);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gles_read);
+    } else {
+        glUseProgram(gles_prog_flat);
+    }
     glBindBuffer(GL_ARRAY_BUFFER, gles_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(GlesVertex)), gles_batch, GL_STREAM_DRAW);
-    glEnableVertexAttribArray((GLuint)gles_loc_pos);
-    glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
-    glEnableVertexAttribArray((GLuint)gles_loc_col);
-    glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
-                          (void *)(2 * sizeof(float)));
+    if (textured) {
+        glEnableVertexAttribArray((GLuint)gles_tex_loc.pos);
+        glVertexAttribPointer((GLuint)gles_tex_loc.pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
+        glEnableVertexAttribArray((GLuint)gles_tex_loc.col);
+        glVertexAttribPointer((GLuint)gles_tex_loc.col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                              (void *)(2 * sizeof(float)));
+        glEnableVertexAttribArray((GLuint)gles_tex_loc.uv);
+        glVertexAttribPointer((GLuint)gles_tex_loc.uv, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                              (void *)(6 * sizeof(float)));
+        glEnableVertexAttribArray((GLuint)gles_tex_loc.page);
+        glVertexAttribPointer((GLuint)gles_tex_loc.page, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                              (void *)(8 * sizeof(float)));
+        glEnableVertexAttribArray((GLuint)gles_tex_loc.win);
+        glVertexAttribPointer((GLuint)gles_tex_loc.win, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                              (void *)(12 * sizeof(float)));
+        glEnableVertexAttribArray((GLuint)gles_tex_loc.flags);
+        glVertexAttribPointer((GLuint)gles_tex_loc.flags, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                              (void *)(16 * sizeof(float)));
+    } else {
+        glEnableVertexAttribArray((GLuint)gles_loc_pos);
+        glVertexAttribPointer((GLuint)gles_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(GlesVertex), (void *)0);
+        glEnableVertexAttribArray((GLuint)gles_loc_col);
+        glVertexAttribPointer((GLuint)gles_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(GlesVertex),
+                              (void *)(2 * sizeof(float)));
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
     glViewport(0, 0, VRAM_W, VRAM_H);
     glDrawArrays(GL_TRIANGLES, 0, n);
@@ -241,36 +426,122 @@ static void gles_vertex(float x, float y, float r, float g, float b, float mask)
         gles_flush();
     }
     v = &gles_batch[gles_batch_n++];
+    memset(v, 0, sizeof(*v));
     v->x = x;
     v->y = y;
     v->r = r;
     v->g = g;
     v->b = b;
     v->mask = mask;
+    v->flags = 3.0f; /* untextured */
 }
 
-/* An untextured rectangle: two triangles, clipped by the drawing area (the scissor) and the mask bit in alpha. */
+/* A batch cannot mix the two programs: a change flushes, like any other state a draw depends on. */
+static void gles_batch_kind(int textured) {
+    if (gles_batch_n > 0 && gles_batch_textured != textured) {
+        gles_flush();
+    }
+    gles_batch_textured = textured;
+}
+
+/* One vertex of a textured primitive: the page and the window travel per vertex (they change between primitives far
+ * more often than between batches, and the reference does the same with its BatchVertex). */
+static void gles_tex_vertex(float x, float y, float u, float v, const GpuEvent *ev) {
+    GlesVertex *gv;
+
+    gles_batch_kind(1);
+    if (gles_batch_n >= GLES_BATCH_MAX) {
+        gles_flush();
+    }
+    gv = &gles_batch[gles_batch_n++];
+    memset(gv, 0, sizeof(*gv));
+    gv->x = x;
+    gv->y = y;
+    gv->r = (float)ev->v[0].r;
+    gv->g = (float)ev->v[0].g;
+    gv->b = (float)ev->v[0].b;
+    gv->mask = ev->set_mask ? 1.0f : 0.0f;
+    gv->u = u;
+    gv->v = v;
+    gv->page_x = (float)ev->tex_x;
+    gv->page_y = (float)ev->tex_y;
+    gv->clut_x = (float)ev->clut_x;
+    gv->clut_y = (float)ev->clut_y;
+    gv->win_x = (float)ev->u_and;
+    gv->win_y = (float)ev->u_or;
+    gv->win_z = (float)ev->v_and;
+    gv->win_w = (float)ev->v_or;
+    gv->flags = (float)(ev->textured - 1); /* 0 4-bit, 1 8-bit, 2 15-bit */
+    gv->raw = ev->raw ? 1.0f : 0.0f;
+}
+
+/* A rectangle: two triangles, clipped by the drawing area (the scissor) and the mask bit in alpha. Textured ones take
+ * their u, v from the corner and advance one texel per pixel, which is what the shim's own loop does. */
 static void gles_rect(const GpuEvent *ev) {
-    float r = (float)ev->v[0].r / 255.0f, g = (float)ev->v[0].g / 255.0f, b = (float)ev->v[0].b / 255.0f;
-    float mask = ev->set_mask ? 1.0f : 0.0f;
     float x0 = (float)ev->x, y0 = (float)ev->y;
     float x1 = x0 + (float)ev->w, y1 = y0 + (float)ev->h;
 
     gles_batch_state(ev);
-    /* The PS1 wraps a rectangle's coordinates to the VRAM instead of clipping them; the scissor clips, so a rectangle
-     * that runs past an edge is drawn up to it here and its wrapped part is not reproduced yet. Rectangles this game
-     * draws inside the page are unaffected, and the VRAM check says so when one is not. */
     if (ev->w <= 0 || ev->h <= 0) {
         return;
     }
-    gles_vertex(x0, y0, r, g, b, mask);
-    gles_vertex(x1, y0, r, g, b, mask);
-    gles_vertex(x0, y1, r, g, b, mask);
-    gles_vertex(x1, y0, r, g, b, mask);
-    gles_vertex(x1, y1, r, g, b, mask);
-    gles_vertex(x0, y1, r, g, b, mask);
+    if (ev->textured) {
+        float u0 = (float)ev->v[0].u, v0 = (float)ev->v[0].v;
+        float u1 = u0 + (float)ev->w, v1 = v0 + (float)ev->h;
+
+        gles_tex_vertex(x0, y0, u0, v0, ev);
+        gles_tex_vertex(x1, y0, u1, v0, ev);
+        gles_tex_vertex(x0, y1, u0, v1, ev);
+        gles_tex_vertex(x1, y0, u1, v0, ev);
+        gles_tex_vertex(x1, y1, u1, v1, ev);
+        gles_tex_vertex(x0, y1, u0, v1, ev);
+        gles_draw_add(ev->x, ev->y, ev->x + ev->w, ev->y + ev->h);
+        return;
+    }
+    {
+        float r = (float)ev->v[0].r, g = (float)ev->v[0].g, b = (float)ev->v[0].b;
+        float mask = ev->set_mask ? 1.0f : 0.0f;
+
+        gles_batch_kind(0);
+        gles_vertex(x0, y0, r, g, b, mask);
+        gles_vertex(x1, y0, r, g, b, mask);
+        gles_vertex(x0, y1, r, g, b, mask);
+        gles_vertex(x1, y0, r, g, b, mask);
+        gles_vertex(x1, y1, r, g, b, mask);
+        gles_vertex(x0, y1, r, g, b, mask);
+        gles_draw_add(ev->x, ev->y, ev->x + ev->w, ev->y + ev->h);
+    }
 }
 
+/* A flat triangle: textured or not, no Gouraud shading, no dithering, opaque. The PS1 interpolates u and v linearly
+ * in screen space; with every vertex at w = 1 that is exactly what a varying does here. */
+static void gles_triangle(const GpuEvent *ev) {
+    int i;
+
+    gles_batch_state(ev);
+    for (i = 0; i < 3; i++) {
+        if (ev->textured) {
+            gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[i].u, (float)ev->v[i].v, ev);
+        } else {
+            float mask = ev->set_mask ? 1.0f : 0.0f;
+
+            gles_batch_kind(0);
+            gles_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[0].r, (float)ev->v[0].g,
+                        (float)ev->v[0].b, mask);
+        }
+    }
+    {
+        int x0 = ev->v[0].x, x1 = x0, y0 = ev->v[0].y, y1 = y0;
+
+        for (i = 1; i < 3; i++) {
+            if (ev->v[i].x < x0) x0 = ev->v[i].x;
+            if (ev->v[i].x > x1) x1 = ev->v[i].x;
+            if (ev->v[i].y < y0) y0 = ev->v[i].y;
+            if (ev->v[i].y > y1) y1 = ev->v[i].y;
+        }
+        gles_draw_add(x0, y0, x1 + 1, y1 + 1);
+    }
+}
 /* A transfer writes its rectangle with every pixel's coordinates masked to the VRAM's edges (gpu.c's gpu_fill,
  * gpu_copy and gpu_load_pixel all do `& 1023` / `& 511`), so a rectangle that runs past an edge lands wrapped. The
  * upload has to split it the same way: one glTexSubImage2D cannot write outside the texture. At most four pieces. */
@@ -327,22 +598,28 @@ static void gles_event(const GpuEvent *ev) {
         /* One upload per transfer: the shim's VRAM already holds the result, including the wrap-around, the mask rules
          * and the row order of an overlapping copy, so the target cannot disagree with it. */
         gles_upload_wrapped(ev->x, ev->y, ev->w, ev->h);
+        gles_draw_add(ev->x, ev->y, ev->x + ev->w, ev->y + ev->h);
         break;
     case GPU_EV_POWER_ON:
         gles_upload_rect(0, 0, VRAM_W, VRAM_H);
+        gles_draw_add(0, 0, VRAM_W, VRAM_H);
         break;
     case GPU_EV_RECT:
-        if (ev->textured) {
-            gles_ev_count[ev->kind]++; /* a sprite waits for M3's CLUT sampling */
-        } else if (ev->semi) {
-            gles_ev_count[ev->kind]++; /* semi-transparent: M4's fragment fetch */
+        if (ev->semi || ev->dither) {
+            gles_ev_count[ev->kind]++; /* semi-transparent or dithered: M4's fragment fetch and dither matrix */
         } else {
             gles_rect(ev);
         }
         break;
     case GPU_EV_TRIANGLE:
+        if (ev->semi || ev->dither || ev->gouraud) {
+            gles_ev_count[ev->kind]++; /* Gouraud shading, semi-transparency or dithering: M4 */
+        } else {
+            gles_triangle(ev);
+        }
+        break;
     case GPU_EV_SEGMENT:
-        gles_ev_count[ev->kind]++;
+        gles_ev_count[ev->kind]++; /* lines: the PS1's own stepping, still to come */
         break;
     }
 }
@@ -486,6 +763,9 @@ int render_gles_raster_start(int scale, char *why, size_t why_size) {
         return 0;
     }
     gles_batch_n = 0;
+    gles_batch_textured = 0;
+    gles_drawn[0] = gles_drawn[2] = VRAM_W;
+    gles_drawn[1] = gles_drawn[3] = 0;
     gles_batch_mask = -1;
     gles_batch_area[0] = gles_batch_area[1] = gles_batch_area[2] = gles_batch_area[3] = -1;
     gles_rasterising = 1;

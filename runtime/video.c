@@ -1010,6 +1010,7 @@ static void video_gles_vram_check(void) {
         const u16 *sw = psyq_gpu_vram();
         int stride = psyq_gpu_vram_stride();
         int x, y, diffs = 0, fx = -1, fy = -1;
+        int bx0 = 1024, by0 = 512, bx1 = -1, by1 = -1;
         u16 fsw = 0, fhw = 0;
 
         for (y = 0; y < 512; y++) {
@@ -1024,6 +1025,10 @@ static void video_gles_vram_check(void) {
                         fsw = a;
                         fhw = b;
                     }
+                    if (x < bx0) bx0 = x;
+                    if (x > bx1) bx1 = x;
+                    if (y < by0) by0 = y;
+                    if (y > by1) by1 = y;
                     diffs++;
                 }
             }
@@ -1033,10 +1038,29 @@ static void video_gles_vram_check(void) {
             port_log("gles: vram check %ld (frame %ld): exact", checks, port_frames);
         } else {
             failed++;
+            if (getenv("DW3_GLES_DUMP") != NULL && failed == 1) {
+                /* One dump of both sides, on the first failure: the quickest way to see what differs is to look. */
+                FILE *f = fopen("/tmp/gles_sw.bin", "wb");
+                int r;
+
+                if (f != NULL) {
+                    for (r = 0; r < 512; r++) {
+                        fwrite(&sw[(size_t)r * stride], 2, 1024, f);
+                    }
+                    fclose(f);
+                }
+                f = fopen("/tmp/gles_hw.bin", "wb");
+                if (f != NULL) {
+                    fwrite(hw, 2, 1024 * 512, f);
+                    fclose(f);
+                }
+                port_log("gles: vram dumped to /tmp/gles_sw.bin and /tmp/gles_hw.bin");
+            }
             port_log("gles: vram check %ld (frame %ld): %.1f%% of the VRAM differs (%d pixels), first at %d,%d"
-                     " sw 0x%04x hw 0x%04x; the undrawn counters say what is missing (triangles %u, rects %u,"
-                     " segments %u)",
+                     " sw 0x%04x hw 0x%04x, inside %d,%d..%d,%d; the undrawn counters say what is missing (triangles %u,"
+                     " rects %u, segments %u)",
                      checks, port_frames, 100.0 * (double)diffs / (1024.0 * 512.0), diffs, fx, fy, fsw, fhw,
+                     bx0, by0, bx1, by1,
                      render_gles_undrawn(0), render_gles_undrawn(1), render_gles_undrawn(2));
         }
     }

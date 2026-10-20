@@ -294,7 +294,64 @@ int main(void) {
         ok &= compare("Rect with set-mask");
     }
 
-    /* 7. Nothing drawn by the CPU: the polygons are counted, not pretended (M3/M4 own them). */
+    /* 7. M3: textured rectangles. The VRAM is the texture here: a 4-bit sprite whose CLUT lives in the page's palette
+     * row, and a 15-bit one read straight, both modulated by the vertex colour as the shim does ((t * c) >> 7). */
+    {
+        int full[4] = {0, 0, 1023, 511};
+        int i2, j2;
+
+        /* The palette at row 8, entry 3: colour 0x7C00 (blue), entry 5: 0x03E0 (green). */
+        vram[8][3] = 0x7C00;
+        vram[8][5] = 0x03E0;
+        /* A 4-bit texture at (64, 16): nibbles 3,5,3,5... packed four per texel. */
+        for (j2 = 0; j2 < 8; j2++) {
+            for (i2 = 0; i2 < 8; i2++) {
+                vram[16 + j2][64 + i2 / 4] = (u16)(0x5353 | ((j2 & 1) ? 0x3000 : 0));
+            }
+        }
+        tell(GPU_EV_LOAD, 0, 0, VRAM_W, VRAM_H, 0, 0); /* the target takes the patterns above */
+        render_gles_frame();
+        {
+            GpuEvent ev;
+
+            memset(&ev, 0, sizeof(ev));
+            ev.kind = GPU_EV_RECT;
+            ev.x = 300;
+            ev.y = 200;
+            ev.w = 8;
+            ev.h = 8;
+            ev.textured = 1; /* 4-bit */
+            ev.tex_x = 64;
+            ev.tex_y = 16;
+            ev.clut_x = 0;
+            ev.clut_y = 8;
+            ev.u_and = 0xFF;
+            ev.u_or = 0;
+            ev.v_and = 0xFF;
+            ev.v_or = 0;
+            ev.v[0].u = 0;
+            ev.v[0].v = 0;
+            ev.v[0].r = ev.v[0].g = ev.v[0].b = 128; /* the "no modulation" colour, as raw textures use */
+            ev.area_x0 = full[0];
+            ev.area_y0 = full[1];
+            ev.area_x1 = full[2];
+            ev.area_y1 = full[3];
+            render_gles_feed(&ev);
+        }
+        render_gles_frame();
+        /* What the shim would draw: for each pixel, the nibble's palette colour, (t * 128) >> 7 = t. */
+        for (j2 = 0; j2 < 8; j2++) {
+            for (i2 = 0; i2 < 8; i2++) {
+                u16 packed = vram[16 + j2][64 + i2 / 4];
+                int idx = (packed >> ((i2 & 3) * 4)) & 0xF;
+
+                vram[200 + j2][300 + i2] = vram[8][idx];
+            }
+        }
+        ok &= compare("Textured 4-bit sprite");
+    }
+
+    /* 8. Nothing drawn by the CPU: the polygons are counted, not pretended (M4 owns them). */
     {
         GpuEvent ev;
 
