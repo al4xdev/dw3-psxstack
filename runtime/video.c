@@ -868,6 +868,19 @@ static void video_present_stat(long long t0, int direct, int bits, int w, int h)
     long long now = port_clock_ns();
     const char *path;
     double ms;
+    PsyqDisplay dd;
+
+    /* Why the direct path was refused: its rectangle has to be linear in the VRAM, and the display area's x can be
+     * anywhere in the 1024-pixel row (the converter wraps, the framebuffer expand cannot). */
+    if (!direct) {
+        static int told;
+
+        psyq_gpu_display(&dd);
+        if (!told) {
+            told = 1;
+            port_log("present: direct refused for %dx%d at %d,%d (24-bit %d)", dd.w, dd.h, dd.x, dd.y, dd.rgb24);
+        }
+    }
 
     if (sec0 == 0) {
         sec0 = now;

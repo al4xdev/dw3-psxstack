@@ -221,6 +221,11 @@ function(psxstack_add_game target)
     target_compile_options(${game_lib} PRIVATE ${COMMON_FLAGS} -fno-builtin -fno-common -fdata-sections
                            -ffunction-sections -Wall -Wno-pointer-sign -Wno-unused-but-set-variable -Wno-unused-variable
                            ${G_UNIT_COMPILE_OPTIONS})
+    # PSXSTACK_GAME_OPT: the game's own C, which otherwise follows the build type (and is at GCC's -O0 when the port
+    # sets none). A port on a slow core can ask for -O2 or -O3 here; a matching decompilation leaves it empty.
+    if(PSXSTACK_GAME_OPT)
+        target_compile_options(${game_lib} PRIVATE ${PSXSTACK_GAME_OPT})
+    endif()
     # GCC 14+ makes some old-C constructs errors; the probe (tools/port_inventory.py) keeps them warnings the same way.
     if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
         target_compile_options(${game_lib} PRIVATE -fpermissive)
