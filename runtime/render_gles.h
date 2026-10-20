@@ -33,6 +33,9 @@ int render_gles_read_vram(unsigned short *out);
 /* The display area as 16-bit pixels (w x h, row-major, stride w) for the existing fb0 present: it does the 2x nearest
  * scaling and the 15-to-16-bit expansion, and reading 320x240 back costs 1.7-1.95 ms. 0 on failure. */
 int render_gles_read_display(unsigned short *out, int x, int y, int w, int h);
+/* The same rectangle, this frame and not the previous one, blocking on the GPU: for a screenshot, which asks for a
+ * named frame and cannot be a vsync late. ~2.4 ms. */
+int render_gles_read_display_now(unsigned short *out, int x, int y, int w, int h);
 /* The events the listener could not draw yet, by GpuEventKind (0 triangle, 1 rect, 2 segment): M1 reports what is left
  * instead of pretending, so a test can assert the transfers match and print the rest as coverage. */
 unsigned render_gles_undrawn(int kind);

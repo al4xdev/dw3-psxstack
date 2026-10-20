@@ -1188,15 +1188,34 @@ static int gles_pbo_pending = -1; /* the buffer holding the read issued last vsy
  * bytes into ordinary memory and the conversion from there a fraction of that. */
 static u8 *gles_display_scratch;
 
-/* The display rectangle into buf (a pixel unpack buffer), or into out when buf is 0 (the blocking first read). */
-static void gles_read_pixels(int x, int y, int w, int h, u8 *out, GLuint buf) {
+/* The display rectangle into buf (a pixel unpack buffer, where `offset` is a byte offset into it), or into out when buf
+ * is 0. */
+static void gles_read_pixels(int x, int y, int w, int h, u8 *out, GLuint buf, size_t offset) {
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
     if (buf != 0) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, buf);
-        glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, (void *)0);
+        glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, (void *)offset);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     } else {
-        glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+        glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out + offset);
+    }
+}
+
+/* A display rectangle with the PS1's wrap at the VRAM's edges: a 576-line PAL display runs off the bottom of the 512-row
+ * VRAM and goes on at row 0, and the shim masks every row with & 511 (`video_convert` does the same). Reading it as one
+ * rectangle made the renderer's picture of that mode wrong past row 512 - the software path had it right. The pieces are
+ * read back to back, so they land in the output in order; columns are not split (this game's display areas never cross
+ * the right edge). */
+static void gles_read_pixels_wrapped(int x, int y, int w, int h, u8 *out, GLuint buf) {
+    int sy = y & (VRAM_H - 1);
+    int first = h;
+
+    if (sy + h > VRAM_H) {
+        first = VRAM_H - sy;
+    }
+    gles_read_pixels(x, sy, w, first, out, buf, 0);
+    if (first < h) {
+        gles_read_pixels(x, 0, w, h - first, out, buf, (size_t)first * (size_t)w * 4);
     }
 }
 
@@ -1215,6 +1234,25 @@ static void gles_display_convert(const u8 *rgba, u16 *out, int w, int h) {
             out[(size_t)j * w + i] = (u16)((r & 31) | ((g & 31) << 5) | ((b & 31) << 10));
         }
     }
+}
+
+/* The display area, now and not a frame later: what a screenshot needs, because a picture of the *previous* vsync is
+ * not the frame that was asked for. It blocks on the GPU like the present used to, which is why the present does not use
+ * it. 0 on failure. */
+int render_gles_read_display_now(u16 *out, int x, int y, int w, int h) {
+    u8 *rgba;
+
+    if (!gles_rasterising || out == NULL || w <= 0 || h <= 0) {
+        return 0;
+    }
+    rgba = malloc((size_t)w * (size_t)h * 4);
+    if (rgba == NULL) {
+        return 0;
+    }
+    gles_read_pixels_wrapped(x, y, w, h, rgba, 0);
+    gles_display_convert(rgba, out, w, h);
+    free(rgba);
+    return 1;
 }
 
 int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
@@ -1252,7 +1290,7 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
     }
     if (gles_pbo_pending < 0) {
         /* The first frame: read it now, so the picture is never a frame late at startup, then start the rotation. */
-        gles_read_pixels(x, y, w, h, gles_display_scratch, 0);
+        gles_read_pixels_wrapped(x, y, w, h, gles_display_scratch, 0);
         if (t_read != 0) {
             long long t1 = (long long)port_gpu_cycles();
 
@@ -1260,7 +1298,7 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
             t_read = t1;
         }
         gles_display_convert(gles_display_scratch, out, w, h);
-        gles_read_pixels(x, y, w, h, NULL, gles_pbo[0]);
+        gles_read_pixels_wrapped(x, y, w, h, NULL, gles_pbo[0]);
         gles_pbo_pending = 0;
     } else {
         int next = 1 - gles_pbo_pending;
@@ -1281,7 +1319,7 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
         }
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         /* This vsync's read, into the buffer that the mapping just freed. */
-        gles_read_pixels(x, y, w, h, NULL, gles_pbo[next]);
+        gles_read_pixels_wrapped(x, y, w, h, NULL, gles_pbo[next]);
         gles_pbo_pending = next;
     }
     if (t_read != 0) {

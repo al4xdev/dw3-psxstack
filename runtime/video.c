@@ -76,6 +76,7 @@ static int video_shot_count;
 static long video_converted_frame = -1; /* the frame video_pixels was converted at (the debug channel's screenshot) */
 static int video_gpu_wanted;            /* --renderer gpu / video.renderer "gpu" */
 static int video_gles_wanted;           /* --renderer gles: the offscreen GLES renderer (render_gles.c) */
+static int video_gles;                  /* the offscreen GLES renderer draws; the present still comes out through fbdev */
 static int video_internal_scale = 1;    /* --internal-scale / video.internal_scale: the rasteriser's, 1..8 */
 static PortFilter video_filter;         /* --filter / video.filter: the hardware renderer's present (render_gpu_present.c) */
 static struct {
@@ -106,11 +107,18 @@ static u32 video_byte(const u16 *row, int x) {
     return (x & 1) ? p >> 8 : p & 0xFF;
 }
 
-/* Converts the current display area into video_pixels (video_w x video_h). */
+/* Converts the current display area into video_pixels (video_w x video_h). With the GLES renderer the 15-bit display is
+ * the renderer's own target: the shim's array holds only the transfers, so a screenshot - or the debug channel's - of it
+ * would come out without the drawn scene. The 24-bit display is a byte view of the VRAM that the RGBA8 target cannot
+ * hold, and it is made of transfers (the movie), so it stays read from the array either way. */
 static void video_convert(void) {
     PsyqDisplay d;
     const u16 *vram = psyq_gpu_vram();
     int w, h, x, y;
+#ifdef PSXSTACK_EGL
+    static u16 *gles_display;
+    int from_target = 0;
+#endif
 
     psyq_gpu_display(&d);
     w = d.w > 0 ? d.w : 320;
@@ -129,6 +137,27 @@ static void video_convert(void) {
         }
         return;
     }
+#ifdef PSXSTACK_EGL
+    if (video_gles && !d.rgb24 && w <= VIDEO_MAX_W && h <= VIDEO_MAX_H) {
+        if (gles_display == NULL) {
+            gles_display = malloc((size_t)VIDEO_MAX_W * VIDEO_MAX_H * 2);
+        }
+        if (gles_display != NULL && render_gles_read_display_now(gles_display, d.x, d.y, w, h)) {
+            from_target = 1;
+            for (y = 0; y < h; y++) {
+                u32 *out = video_pixels + (size_t)y * w;
+                const u16 *src = gles_display + (size_t)y * w;
+
+                for (x = 0; x < w; x++) {
+                    out[x] = video_rgb15(src[x]);
+                }
+            }
+        }
+    }
+    if (from_target) {
+        return;
+    }
+#endif
     for (y = 0; y < h; y++) {
         const u16 *row = vram + (size_t)((d.y + y) & 511) * psyq_gpu_vram_stride();
         u32 *out = video_pixels + (size_t)y * w;
@@ -604,7 +633,6 @@ static long video_presents;
 static FbdevPresent fbdev;
 static int fbdev_active;
 #ifdef PSXSTACK_EGL
-static int video_gles; /* the offscreen GLES renderer draws; the present still comes out through fbdev */
 static long video_gles_check_every; /* DW3_GLES_CHECK: frames between VRAM comparisons, 0 off */
 /* The display area as the renderer reads it back: 320x240 of 16-bit pixels, presented by Fbdev_PresentVram. */
 static u16 video_gles_display[VIDEO_MAX_W * VIDEO_MAX_H];
@@ -967,10 +995,12 @@ static int video_present_direct(long long *t0) {
         return 0;
     }
 #ifdef PSXSTACK_EGL
-    if (video_gles && d.w <= VIDEO_MAX_W && d.h <= VIDEO_MAX_H) {
+    if (video_gles && !d.rgb24 && d.w <= VIDEO_MAX_W && d.h <= VIDEO_MAX_H) {
         /* The display's pixels come from the renderer's VRAM target, not from the shim's array: with the listener
-         * replacing the rasteriser, the array has only what the transfers wrote. The 24-bit modes stay on the software
-         * path for now (the GLES target holds 5-5-5-1, and nothing in this game's battles uses them). */
+         * replacing the rasteriser, the array has only what the transfers wrote. A 24-bit display is excluded on purpose:
+         * it is three bytes per pixel of the VRAM words, which the RGBA8 target does not hold (it stores 5-5-5-1 per
+         * word), so feeding it the converted 15-bit picture drew the movie with the wrong colours. Those come from the
+         * array, which for a 24-bit display is exactly where the movie is (the MDEC writes it through the shim). */
         if (render_gles_read_display(video_gles_display, d.x, d.y, d.w, d.h) &&
             Fbdev_PresentVram(&fbdev, video_gles_display, d.w, 0, 0, d.w, d.h, d.rgb24) == 0) {
             video_w = d.w;
