@@ -184,7 +184,7 @@ static int video_try_ppm(const char *path) {
 
 int port_video_set_renderer(const char *name) {
     if (strcmp(name, "software") == 0 || strcmp(name, "gpu") == 0 || strcmp(name, "gles") == 0) {
-        video_gpu_wanted = name[0] == 'g';
+        video_gpu_wanted = strcmp(name, "gpu") == 0; /* not "gles": that one is offscreen and has its own flag */
         video_gles_wanted = strcmp(name, "gles") == 0;
         return 1;
     }

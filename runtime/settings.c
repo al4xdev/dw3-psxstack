@@ -223,10 +223,12 @@ void port_settings_load(const char *path) {
             port_settings_fail("video.refresh", "50 (PAL) or 60, not %d", s->refresh);
         }
         if ((v = settings_member(obj, "video", "renderer", PORT_JSON_STRING)) != NULL) {
-            if (strcmp(v->string, "software") != 0 && strcmp(v->string, "gpu") != 0) {
-                port_settings_fail("video.renderer", "\"software\" or \"gpu\", not \"%s\"", v->string);
+            if (strcmp(v->string, "software") != 0 && strcmp(v->string, "gpu") != 0 &&
+                strcmp(v->string, "gles") != 0) {
+                port_settings_fail("video.renderer", "\"software\", \"gpu\" or \"gles\", not \"%s\"", v->string);
             }
-            s->gpu = v->string[0] == 'g';
+            s->gpu = strcmp(v->string, "gpu") == 0;
+            s->gles = strcmp(v->string, "gles") == 0;
         }
         settings_int(obj, "video", "internal_scale", 1, 8, &s->internal_scale);
         if ((v = settings_member(obj, "video", "subpixel", PORT_JSON_STRING)) != NULL) {
@@ -286,7 +288,7 @@ void port_settings_print(FILE *f, const PortSettings *s) {
     fprintf(f, "\n  },\n  \"video\": {\n    \"window\": %s,\n    \"scale\": %d,\n    \"fullscreen\": %s,\n"
                "    \"refresh\": %d,\n    \"renderer\": \"%s\",\n    \"internal_scale\": %d",
             s->window ? "true" : "false", s->scale, s->fullscreen ? "true" : "false", s->refresh,
-            s->gpu ? "gpu" : "software", s->internal_scale);
+            s->gles ? "gles" : s->gpu ? "gpu" : "software", s->internal_scale);
     fprintf(f, ",\n    \"subpixel\": \"%s\"", s->subpixel == 2 ? "perspective" : s->subpixel ? "on" : "off");
     fprintf(f, ",\n    \"filter\": \"%s\"", port_filter_names[s->filter]);
     fprintf(f, ",\n    \"crt\": { \"scanlines\": %d, \"mask\": %d, \"curvature\": %d }", s->crt_scanlines, s->crt_mask,

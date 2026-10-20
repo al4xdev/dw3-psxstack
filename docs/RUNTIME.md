@@ -82,7 +82,10 @@ a 480-line display come out the same size), `--fullscreen` (F11 toggles). `--scr
 build, also headless) writes the image of vsync FRAME as a binary PPM: the texture's pixels, independent of the window.
 **The renderer** (docs/PORT.md "Rendering"): `--renderer software` (the default) presents through
 SDL_Renderer; `--renderer gpu` (or `video.renderer: "gpu"`) through the hardware renderer, `runtime/render_gpu.c` on SDL_GPU
-(Vulkan; on Windows Direct3D 12 first, `SDL_GPU_DRIVER=vulkan` or `direct3d12` picks one). It is opened before any SDL_Renderer (on Wayland a window that had an OpenGL renderer cannot be claimed by
+(Vulkan; on Windows Direct3D 12 first, `SDL_GPU_DRIVER=vulkan` or `direct3d12` picks one). `--renderer gles` (or
+`video.renderer: "gles"`) is a third one, `runtime/render_gles.c`, built only with `-DPSXSTACK_EGL`: it renders the VRAM
+offscreen through EGL on a GBM device - no window, no DRM master, no mode change - and the picture leaves through the
+same fbdev present. `--renderer` overrides the file; with neither, the file alone decides. It is opened before any SDL_Renderer (on Wayland a window that had an OpenGL renderer cannot be claimed by
 Vulkan); when it cannot present (no Vulkan driver, NVIDIA on the offscreen driver, a shader that does not load) the run
 logs `renderer: gpu unavailable (<why>); software` and uses SDL_Renderer. Its rasteriser draws the game itself into a
 VRAM target of its own (`runtime/render_gpu.c`'s header comment) and a 15-bit display is presented from that target; 24-bit

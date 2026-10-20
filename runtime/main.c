@@ -198,6 +198,9 @@ int main(int argc, char **argv) {
         window = port_settings.window;
         scale = port_settings.scale;
         fullscreen = port_settings.fullscreen;
+        /* The renderer the file asks for, as the default --renderer overrides below. It used to be read into `gpu`
+         * alone, which only --print-settings ever looked at: a file saying "gpu" ran software. */
+        renderer = port_settings.gles ? "gles" : port_settings.gpu ? "gpu" : "software";
         gpu = port_settings.gpu;
         internal_scale = port_settings.internal_scale;
         subpixel = port_settings.subpixel;
@@ -309,7 +312,7 @@ int main(int argc, char **argv) {
                 return 64;
             }
             renderer = argv[++i];
-            gpu = renderer[0] == 'g';
+            gpu = strcmp(renderer, "gpu") == 0;
         } else if (strcmp(argv[i], "--internal-scale") == 0 && i + 1 < argc) {
             internal_scale = (int)number(argv[i + 1], argv[i]);
             i++;

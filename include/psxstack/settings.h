@@ -21,7 +21,9 @@ typedef struct PortSettings {
     int scale;       /* video.scale, 1..16 (default 2) */
     int fullscreen;  /* video.fullscreen (default 0) */
     int refresh;     /* video.refresh, 50 or 60 (default 50) */
-    int gpu;         /* video.renderer: 0 "software" (default), 1 "gpu" (the hardware renderer; issue #31) */
+    int gpu;         /* video.renderer: "gpu" (the hardware renderer built into the window; issue #31) */
+    int gles;        /* video.renderer: "gles" (the offscreen GLES renderer of a -DPSXSTACK_EGL build). Both 0 is
+                      * "software", the default: a build that has no EGL and no GPU still runs */
     int internal_scale; /* video.internal_scale, 1..8 (default 1): the hardware renderer's resolution, x 1024x512 */
     int subpixel;    /* video.subpixel: 0 "off", 1 "on" (default), 2 "perspective": the GTE's sub-pixel positions above
                       * internal scale 1 (2: textured perspective-correct too) */
