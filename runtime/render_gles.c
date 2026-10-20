@@ -83,12 +83,14 @@ static int gles_batch_n;
 static GLuint gles_prog_flat, gles_prog_tex, gles_vbo;
 static GLint gles_loc_pos = -1, gles_loc_col = -1; /* the flat program's */
 static struct {
-    GLint pos, col, uv, page, win, flags, vram, set_mask, semi, check;
+    GLint pos, col, uv, page, win, flags, vram, set_mask, semi, check, gouraud, dither;
 } gles_tex_loc;
 static int gles_batch_textured; /* the kind of primitives in the batch: the two programs cannot mix */
 static int gles_batch_area[4] = {-1, -1, -1, -1};
 static int gles_batch_mask = -1;
 static int gles_batch_semi = -1;   /* 0 opaque, 1..4 the PS1's modes */
+static int gles_batch_gouraud;
+static int gles_batch_dither;
 static int gles_batch_check = -1;  /* the mask test */
 static int gles_drawn[4];          /* what the target has drawn since the read copy was last refreshed */
 static int gles_replace = 1;  /* the listener draws instead of the software rasteriser (--renderer gles) */
@@ -205,6 +207,8 @@ static const char *GLES_TEX_FS =
     "uniform int u_set_mask;\n"
     "uniform int u_semi;\n"      /* 0 opaque; 1..4 the PS1's modes 0..3 */
     "uniform int u_check_mask;\n"
+    "uniform int u_gouraud;\n"   /* the 8-bit pipeline: Gouraud shading and the dither matrix */
+    "uniform int u_dither;\n"
     "in vec4 v_col;\n"
     "in vec2 v_uv;\n"
     "flat in ivec4 v_page;\n"
@@ -216,6 +220,12 @@ static const char *GLES_TEX_FS =
     "  vec4 c = texelFetch(u_vram, t, 0);\n"
     "  return uint(c.r * 31.0 + 0.5) | (uint(c.g * 31.0 + 0.5) << 5) | (uint(c.b * 31.0 + 0.5) << 10)\n"
     "       | (c.a > 0.5 ? 0x8000u : 0u);\n"
+    "}\n"
+    /* psx-spx "Dithering", the matrix the shim carries (gpu.c gpu_dither). */
+    "int dither_at(ivec2 p) {\n"
+    "  int i = (p.y & 3) * 4 + (p.x & 3);\n"
+    "  int m[16] = int[16](-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2);\n"
+    "  return m[i];\n"
     "}\n"
     "vec4 unpack5(uint v) {\n"
     "  return vec4(float(v & 31u), float((v >> 5) & 31u), float((v >> 10) & 31u), float((v >> 15) & 1u));\n"
@@ -252,13 +262,28 @@ static const char *GLES_TEX_FS =
     "  vec3 bg5 = floor(bg.rgb * 31.0 + 0.5);\n"
     "  if (u_check_mask != 0 && bg.a > 0.5) { discard; }\n"
     "  bool blend = u_semi != 0 && (u_semi == 1 || (texel & 0x8000u) != 0u);\n"
-    "  if (blend) {\n"
-    "    int mode = u_semi - 1;\n"
+    "  int mode = u_semi - 1;\n"
+    "  if (u_gouraud != 0) {\n"
+    /* The dithered pipeline, in 8-bit units as the shim computes it (gpu.c gpu_pixel, m->eight): the foreground is
+     * (texel * colour) >> 4, or the texel << 3 raw, or the colour itself untextured; the blend against the background
+     * << 3 happens before the dither offset, and the result is cut to 5 bits at the end. */
+    "    vec3 fg8 = raw ? t.rgb * 8.0 : (depth != 3 ? floor(t.rgb * v_col.rgb / 16.0) : v_col.rgb);\n"
+    "    if (blend) {\n"
+    "      vec3 bg8 = bg5 * 8.0;\n"
+    "      if (mode == 0) { fg8 = (bg8 + fg8) * 0.5; }\n"
+    "      else if (mode == 1) { fg8 = bg8 + fg8; }\n"
+    "      else if (mode == 2) { fg8 = bg8 - fg8; }\n"
+    "      else { fg8 = bg8 + floor(fg8 * 0.25); }\n"
+    "    }\n"
+    "    if (u_dither != 0) { fg8 += float(dither_at(ivec2(gl_FragCoord.xy))); }\n"
+    "    fg8 = clamp(fg8, vec3(0.0), vec3(255.0));\n"
+    "    colour = floor(fg8 / 8.0);\n"
+    "  } else if (blend) {\n"
     "    if (mode == 0) { colour = floor((bg5 + colour) * 0.5); }\n"
     "    else if (mode == 1) { colour = min(bg5 + colour, vec3(31.0)); }\n"
     "    else if (mode == 2) { colour = max(bg5 - colour, vec3(0.0)); }\n"
     "    else { colour = min(bg5 + floor(colour * 0.25), vec3(31.0)); }\n"
-    "    colour = min(colour, vec3(31.0));\n"
+    "    colour = clamp(colour, vec3(0.0), vec3(31.0));\n"
     "  }\n"
     "  o_col = vec4(floor(colour * 8.22580645 + 0.5) / 255.0, mask);\n" /* 255 / 31 */
     "}\n";
@@ -334,6 +359,8 @@ static int gles_pipelines(char *why, size_t why_size) {
         gles_tex_loc.set_mask = glGetUniformLocation(gles_prog_tex, "u_set_mask");
         gles_tex_loc.semi = glGetUniformLocation(gles_prog_tex, "u_semi");
         gles_tex_loc.check = glGetUniformLocation(gles_prog_tex, "u_check_mask");
+        gles_tex_loc.gouraud = glGetUniformLocation(gles_prog_tex, "u_gouraud");
+        gles_tex_loc.dither = glGetUniformLocation(gles_prog_tex, "u_dither");
     }
     glGenBuffers(1, &gles_vbo);
     return 1;
@@ -400,6 +427,8 @@ static void gles_flush(void) {
         glUniform1i(gles_tex_loc.set_mask, gles_batch_mask);
         glUniform1i(gles_tex_loc.semi, gles_batch_semi > 0 ? gles_batch_semi : 0);
         glUniform1i(gles_tex_loc.check, gles_batch_check);
+        glUniform1i(gles_tex_loc.gouraud, gles_batch_gouraud);
+        glUniform1i(gles_tex_loc.dither, gles_batch_dither);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, gles_read);
     } else {
@@ -499,9 +528,18 @@ static void gles_batch_kind(int textured) {
     gles_batch_textured = textured;
 }
 
+/* The Gouraud and dither flags are shader uniforms: a change flushes, like any other state a draw depends on. */
+static void gles_batch_flags(int gouraud, int dither) {
+    if (gles_batch_n > 0 && (gles_batch_gouraud != gouraud || gles_batch_dither != dither)) {
+        gles_flush();
+    }
+    gles_batch_gouraud = gouraud;
+    gles_batch_dither = dither;
+}
+
 /* One vertex of a textured primitive: the page and the window travel per vertex (they change between primitives far
  * more often than between batches, and the reference does the same with its BatchVertex). */
-static void gles_tex_vertex(float x, float y, float u, float v, const GpuEvent *ev) {
+static void gles_tex_vertex(float x, float y, float u, float v, const GpuEvent *ev, const GpuVertex *col) {
     GlesVertex *gv;
 
     gles_batch_kind(1);
@@ -512,9 +550,11 @@ static void gles_tex_vertex(float x, float y, float u, float v, const GpuEvent *
     memset(gv, 0, sizeof(*gv));
     gv->x = x;
     gv->y = y;
-    gv->r = (float)ev->v[0].r;
-    gv->g = (float)ev->v[0].g;
-    gv->b = (float)ev->v[0].b;
+    /* The colour is per vertex when the primitive is Gouraud (the PS1 interpolates it across the triangle) and the
+     * first vertex's otherwise, which is what the shim does. */
+    gv->r = (float)col->r;
+    gv->g = (float)col->g;
+    gv->b = (float)col->b;
     gv->mask = ev->set_mask ? 1.0f : 0.0f;
     gv->u = u;
     gv->v = v;
@@ -553,12 +593,12 @@ static void gles_rect(const GpuEvent *ev) {
         float u0 = (float)ev->v[0].u, v0 = (float)ev->v[0].v;
         float u1 = u0 + (float)ev->w, v1 = v0 + (float)ev->h;
 
-        gles_tex_vertex(x0, y0, u0, v0, ev);
-        gles_tex_vertex(x1, y0, u1, v0, ev);
-        gles_tex_vertex(x0, y1, u0, v1, ev);
-        gles_tex_vertex(x1, y0, u1, v0, ev);
-        gles_tex_vertex(x1, y1, u1, v1, ev);
-        gles_tex_vertex(x0, y1, u0, v1, ev);
+        gles_tex_vertex(x0, y0, u0, v0, ev, &ev->v[0]);
+        gles_tex_vertex(x1, y0, u1, v0, ev, &ev->v[0]);
+        gles_tex_vertex(x0, y1, u0, v1, ev, &ev->v[0]);
+        gles_tex_vertex(x1, y0, u1, v0, ev, &ev->v[0]);
+        gles_tex_vertex(x1, y1, u1, v1, ev, &ev->v[0]);
+        gles_tex_vertex(x0, y1, u0, v1, ev, &ev->v[0]);
         gles_draw_add(ev->x, ev->y, ev->x + ev->w, ev->y + ev->h);
         return;
     }
@@ -583,15 +623,25 @@ static void gles_triangle(const GpuEvent *ev) {
     int i;
 
     gles_batch_state(ev);
+    gles_batch_flags(ev->gouraud || ev->dither, ev->dither);
     for (i = 0; i < 3; i++) {
         if (ev->textured) {
-            gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[i].u, (float)ev->v[i].v, ev);
+            gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[i].u, (float)ev->v[i].v, ev,
+                            &ev->v[i]);
         } else {
             float mask = ev->set_mask ? 1.0f : 0.0f;
 
             gles_batch_kind(0);
-            gles_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[0].r, (float)ev->v[0].g,
-                        (float)ev->v[0].b, mask);
+            /* A Gouraud triangle interpolates its colour, so it goes through the textured program's 8-bit pipeline
+             * with depth = 3 (untextured): the flat program has no dithering, and the PS1 dithers Gouraud primitives
+             * only. */
+            if (ev->gouraud || ev->dither) {
+                gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, 0.0f, 0.0f, ev, &ev->v[i]);
+                gles_batch[gles_batch_n - 1].flags = 3.0f; /* untextured */
+            } else {
+                gles_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[0].r, (float)ev->v[0].g,
+                            (float)ev->v[0].b, mask);
+            }
         }
     }
     {
