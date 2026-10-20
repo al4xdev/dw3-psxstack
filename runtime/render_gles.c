@@ -475,8 +475,9 @@ static void gles_flush(void) {
     }
     gles_flush_points(); /* the points below came earlier in the stream */
     if (textured) {
-        /* The shader samples the read copy: bring it up to date before drawing into the target again. */
-        gles_read_sync();
+        /* The shader samples the read copy, which render_gles_frame brings up to date once per vsync. Syncing here
+         * instead - once per batch, ~110 times a battle frame - is the likely reason the battle ran at 18.7 fps against
+         * the software renderer's 34: each glBlitFramebuffer waits for the drawing before it and stalls the pipeline. */
         glUseProgram(gles_prog_tex);
         glUniform1i(gles_tex_loc.vram, 0);
         glUniform1i(gles_tex_loc.set_mask, gles_batch_mask);
@@ -998,10 +999,14 @@ int render_gles_rasterising(void) {
 /* Once per vsync. The transfers upload as they happen, so nothing is pending here yet; this is where the batch
  * flush, the read copy (blit of the dirty rectangle) and the display pass land as M2 and M3 arrive. */
 void render_gles_frame(void) {
-    if (gles_rasterising) {
-        gles_flush();
-        gles_flush_points();
+    if (!gles_rasterising) {
+        return;
     }
+    gles_flush();
+    gles_flush_points();
+    /* Everything drawn this vsync goes into the read copy once, here: the next vsync's textured primitives sample it.
+     * One blit of the rectangle that changed, instead of one per batch. */
+    gles_read_sync();
 }
 
 /* The display area back as 16-bit pixels, for the present that already exists (runtime/fbdev_present.c does the 2x
