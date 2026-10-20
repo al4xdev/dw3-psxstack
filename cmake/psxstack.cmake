@@ -38,6 +38,7 @@ option(PSXSTACK_SANITIZE "Build with -fsanitize=address,undefined" OFF)
 option(PSXSTACK_M32 "Build a 32-bit binary (-m32, gcc-multilib): its --log must equal the 64-bit build's" OFF)
 option(PSXSTACK_SDL "The window (runtime/video.c, input.c) over SDL3 (tools/sdl3: scripts/setup.sh sdl3 dxc)" OFF)
 option(PSXSTACK_SDL2 "The window, input and audio over SDL2 and fbdev (R36S / embedded Linux)" OFF)
+option(PSXSTACK_EGL "The GLES renderer (runtime/render_gles.c): offscreen EGL on a GBM device" OFF)
 option(PSXSTACK_PSYQ_WERROR "-Werror for the shim too (the runtime always has it)" ON)
 set(PSXSTACK_UNIT_OVERRIDES "" CACHE STRING
     "Experiments: units to build from another file, as <unit path>=<path> entries (the game's tree is untouched)")
@@ -435,6 +436,14 @@ function(psxstack_add_game target)
         target_sources(${target} PRIVATE "${PSXSTACK_ROOT}/runtime/fbdev_present.c")
         # The present is every frame (the measured 10 ms / 23 ms). -O3: the NEON expand below relies on it.
         set_property(SOURCE "${PSXSTACK_ROOT}/runtime/fbdev_present.c" APPEND PROPERTY COMPILE_OPTIONS -O3)
+    endif()
+    if(PSXSTACK_EGL)
+        # The GLES renderer (runtime/render_gles.c): offscreen EGL on a GBM device, no window (docs/gpu in the game
+        # repository). It needs the EGL, GLES and GBM headers, which embedded images have and desktops often do not,
+        # which is why it is its own option instead of riding on PSXSTACK_SDL2.
+        target_sources(${target} PRIVATE "${PSXSTACK_ROOT}/runtime/render_gles.c")
+        target_compile_definitions(${target} PRIVATE PSXSTACK_EGL)
+        target_link_libraries(${target} PRIVATE EGL GLESv2 gbm)
     endif()
     message(STATUS "psxstack: ${target}: ${n_units} units")
 endfunction()
