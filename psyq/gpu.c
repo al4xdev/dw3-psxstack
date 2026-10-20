@@ -1324,25 +1324,32 @@ unsigned long long port_gpu_cycles(void) {
 #endif
 }
 
-/* DW3_SKIP_BIG=N: draw no triangle whose bounding box covers more than N pixels, to weigh a scene's background (the
- * battle's arena is a few screen-sized textured quads). A measurement switch: the picture is wrong on purpose. */
+/* DW3_SKIP_BIG=N: draw no triangle (by its bounding box) and no rectangle over N pixels, to weigh a scene's background
+ * — a battle's arena is a few screen-sized textured rectangles, not triangles. A measurement switch: the picture is
+ * wrong on purpose while it is set. */
 static int gpu_skip_big = -1;
 
-static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud);
-
-static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud) {
+static int gpu_skip_above(void) {
     if (gpu_skip_big < 0) {
         const char *env = getenv("DW3_SKIP_BIG");
 
         gpu_skip_big = env != NULL ? atoi(env) : 0;
     }
-    if (gpu_skip_big > 0) {
+    return gpu_skip_big;
+}
+
+static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud);
+
+static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud) {
+    int big = gpu_skip_above();
+
+    if (big > 0) {
         int x0 = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
         int x1 = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
         int y0 = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
         int y1 = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
 
-        if ((long)(x1 - x0) * (y1 - y0) > gpu_skip_big) {
+        if ((long)(x1 - x0) * (y1 - y0) > big) {
             return;
         }
     }
@@ -1677,6 +1684,10 @@ static void gpu_rectangle(const u32 *w) {
     }
     gpu_mode_from_texpage(&m);
     m.dither = 0;
+    /* The same measurement switch as gpu_triangle's: a scene's background is usually rectangles, not triangles. */
+    if (gpu_skip_above() > 0 && (long)width * height > gpu_skip_big) {
+        return;
+    }
     if (gpu_listener != NULL) {
         GpuEvent ev;
         gpu_event_mode(&ev, GPU_EV_RECT, &m);
