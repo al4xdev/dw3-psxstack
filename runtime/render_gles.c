@@ -59,6 +59,7 @@ static char gles_what[96];
 
 /* What the listener was asked to draw but cannot yet: the M2/M3/M4 work, counted so a test can report it. */
 static unsigned gles_ev_count[8];
+static unsigned gles_undrawn_gouraud, gles_undrawn_semi, gles_undrawn_dither;
 static unsigned long gles_uploaded; /* pixels uploaded from the shim's VRAM since the start (logged by the check) */
 
 /* The batch the drawing accumulates in (M2: untextured rectangles). It flushes when the state a draw depends on
@@ -261,7 +262,9 @@ static const char *GLES_TEX_FS =
     "  vec4 bg = gl_LastFragColorARM;\n"
     "  vec3 bg5 = floor(bg.rgb * 31.0 + 0.5);\n"
     "  if (u_check_mask != 0 && bg.a > 0.5) { discard; }\n"
-    "  bool blend = u_semi != 0 && (u_semi == 1 || (texel & 0x8000u) != 0u);\n"
+    /* A textured pixel blends only where its texel's bit 15 is set, unless the mode is 0 (which blends everywhere);
+     * an untextured one has no texel, so it blends wherever the primitive says so (gpu.c gpu_pixel). */
+    "  bool blend = u_semi != 0 && (depth == 3 || u_semi == 1 || (texel & 0x8000u) != 0u);\n"
     "  int mode = u_semi - 1;\n"
     "  if (u_gouraud != 0) {\n"
     /* The dithered pipeline, in 8-bit units as the shim computes it (gpu.c gpu_pixel, m->eight): the foreground is
@@ -602,6 +605,23 @@ static void gles_rect(const GpuEvent *ev) {
         gles_draw_add(ev->x, ev->y, ev->x + ev->w, ev->y + ev->h);
         return;
     }
+    if (ev->semi || ev->dither) {
+        /* The flat program has no blending and no dithering: these go through the textured one as untextured
+         * primitives (depth 3), which is where the PS1's 8-bit pipeline and its modes live. */
+        int i;
+
+        gles_batch_flags(0, ev->dither);
+        for (i = 0; i < 6; i++) {
+            static const int corner[6][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 1}};
+            float x = corner[i][0] ? x1 : x0;
+            float y = corner[i][1] ? y1 : y0;
+
+            gles_tex_vertex(x, y, 0.0f, 0.0f, ev, &ev->v[0]);
+            gles_batch[gles_batch_n - 1].flags = 3.0f; /* untextured */
+        }
+        gles_draw_add(ev->x, ev->y, ev->x + ev->w, ev->y + ev->h);
+        return;
+    }
     {
         float r = (float)ev->v[0].r, g = (float)ev->v[0].g, b = (float)ev->v[0].b;
         float mask = ev->set_mask ? 1.0f : 0.0f;
@@ -622,26 +642,26 @@ static void gles_rect(const GpuEvent *ev) {
 static void gles_triangle(const GpuEvent *ev) {
     int i;
 
+    /* One program for everything that blends, dithers or interpolates: the textured one, with depth 3 when the
+     * primitive has no texture. The flat program stays for the simple opaque, undithered case, where its arithmetic is
+     * the same and it is a little cheaper. */
+    int simple = !ev->textured && !ev->semi && !ev->dither && !ev->gouraud;
+
     gles_batch_state(ev);
     gles_batch_flags(ev->gouraud || ev->dither, ev->dither);
     for (i = 0; i < 3; i++) {
         if (ev->textured) {
             gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[i].u, (float)ev->v[i].v, ev,
                             &ev->v[i]);
-        } else {
+        } else if (simple) {
             float mask = ev->set_mask ? 1.0f : 0.0f;
 
             gles_batch_kind(0);
-            /* A Gouraud triangle interpolates its colour, so it goes through the textured program's 8-bit pipeline
-             * with depth = 3 (untextured): the flat program has no dithering, and the PS1 dithers Gouraud primitives
-             * only. */
-            if (ev->gouraud || ev->dither) {
-                gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, 0.0f, 0.0f, ev, &ev->v[i]);
-                gles_batch[gles_batch_n - 1].flags = 3.0f; /* untextured */
-            } else {
-                gles_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[0].r, (float)ev->v[0].g,
-                            (float)ev->v[0].b, mask);
-            }
+            gles_vertex((float)ev->v[i].x, (float)ev->v[i].y, (float)ev->v[0].r, (float)ev->v[0].g,
+                        (float)ev->v[0].b, mask);
+        } else {
+            gles_tex_vertex((float)ev->v[i].x, (float)ev->v[i].y, 0.0f, 0.0f, ev, &ev->v[i]);
+            gles_batch[gles_batch_n - 1].flags = 3.0f; /* untextured */
         }
     }
     {
@@ -736,8 +756,6 @@ static void gles_event(const GpuEvent *ev) {
     case GPU_EV_TRIANGLE:
         if ((gles_off_flat && !ev->textured) || (gles_off_tex && ev->textured)) {
             gles_ev_count[ev->kind]++;
-        } else if (ev->semi || ev->dither || ev->gouraud) {
-            gles_ev_count[ev->kind]++; /* Gouraud shading, semi-transparency or dithering: M4 */
         } else {
             gles_triangle(ev);
         }
@@ -1026,6 +1044,12 @@ int render_gles_read_vram(u16 *out) {
 }
 
 /* The events the listener could not draw yet, by GpuEventKind: M1 reports them instead of pretending. */
+void render_gles_undrawn_reasons(unsigned *gouraud, unsigned *semi, unsigned *dither) {
+    if (gouraud != NULL) *gouraud = gles_undrawn_gouraud;
+    if (semi != NULL) *semi = gles_undrawn_semi;
+    if (dither != NULL) *dither = gles_undrawn_dither;
+}
+
 unsigned long render_gles_uploaded(void) {
     return gles_uploaded;
 }

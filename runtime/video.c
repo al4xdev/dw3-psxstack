@@ -1063,6 +1063,12 @@ static void video_gles_vram_check(void) {
                      bx0, by0, bx1, by1,
                      render_gles_undrawn(0), render_gles_undrawn(1), render_gles_undrawn(2),
                      render_gles_uploaded());
+            {
+                unsigned g = 0, s2 = 0, d = 0;
+
+                render_gles_undrawn_reasons(&g, &s2, &d);
+                port_log("gles: undrawn reasons: gouraud %u, semi %u, dither %u", g, s2, d);
+            }
         }
     }
 }

@@ -39,6 +39,8 @@ unsigned render_gles_undrawn(int kind);
 /* Pixels uploaded from the shim's VRAM since the start: a transfer that never reaches the target shows up as this
  * counter not moving while the VRAM on the other side changes. */
 unsigned long render_gles_uploaded(void);
+/* Why the undrawn triangles are undrawn: Gouraud shading, semi-transparency or dithering (any combination). */
+void render_gles_undrawn_reasons(unsigned *gouraud, unsigned *semi, unsigned *dither);
 /* The listener's entry point, the same function gpu.c calls: a test can feed a transfer sequence without the shim
  * (tests/gles_selftest.c). Ignored unless rasterising. */
 void render_gles_feed(const void *ev);
