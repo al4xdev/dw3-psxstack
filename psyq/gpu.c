@@ -57,7 +57,7 @@
  * with padding. 1056 pixels (2112 bytes) is 33 cache lines: every row stays 64-byte aligned (the A35's read-allocate
  * mode wants whole lines, and a stream of them keeps the row being drawn out of the way) and no row aliases another in
  * a 4-way set. The visible row is still 1024 pixels; only the addressing changes. */
-#define VRAM_PAD 0 /* A/B: 0 is the layout of the build that ran at 50 fps; 8 and 32 are the padded variants */
+#define VRAM_PAD 32
 #define VRAM_STRIDE (VRAM_W + VRAM_PAD)
 
 static u16 gpu_vram[VRAM_STRIDE * VRAM_H] __attribute__((aligned(64)));
