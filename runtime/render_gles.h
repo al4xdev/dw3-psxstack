@@ -22,6 +22,9 @@ const char *render_gles_describe(void);
  * shim's VRAM as it is now. Native resolution only (scale must be 1). 0 on failure (why says it). */
 int render_gles_raster_start(int scale, char *why, size_t why_size);
 int render_gles_rasterising(void);
+/* 1 (the default): the listener draws and the software rasteriser stops (gpu_set_listener_replaces). 0: the CPU keeps
+ * drawing too, which is how the VRAM check runs the two against each other. Before render_gles_raster_start. */
+void render_gles_set_replace(int on);
 /* Once per vsync: the rectangles the transfers touched are uploaded, then the read copy is refreshed. */
 void render_gles_frame(void);
 /* The whole target as the shim's 16-bit pixels (1024x512): the exactness test's comparison with the software VRAM.

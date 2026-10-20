@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "psyq_internal.h"
 #include "render_gles.h"
@@ -49,6 +50,14 @@ void gpu_set_listener(void (*listener)(const GpuEvent *ev)) {
 
 void gpu_set_listener_replaces(int on) {
     listener_replaces = on != 0;
+}
+
+/* The clock the display readback's DW3_GLES_LOG uses; the test never enables it. */
+long long port_clock_ns(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
 }
 
 void port_log(const char *fmt, ...) {
@@ -99,6 +108,51 @@ static void sw_copy(int sx, int sy, int dx, int dy, int w, int h, int set_mask, 
             *d = (u16)(p | set_mask);
         }
     }
+}
+
+/* An untextured, opaque, undithered rectangle as gpu.c draws it: the 15-bit colour into every pixel inside the
+ * drawing area, no mask bit unless set-mask is on. (gpu.c's gpu_rectangle with textured = semi = dither = 0.) */
+static void sw_rect(int x, int y, int w, int h, int r, int g, int b, int area[4], int set_mask) {
+    int i, j;
+    u16 c = (u16)(((r >> 3) & 31) | (((g >> 3) & 31) << 5) | (((b >> 3) & 31) << 10) | (set_mask ? 0x8000 : 0));
+
+    for (j = 0; j < h; j++) {
+        int py = y + j;
+
+        if (py < area[1] || py > area[3]) {
+            continue;
+        }
+        for (i = 0; i < w; i++) {
+            int px = x + i;
+
+            if (px < area[0] || px > area[2]) {
+                continue;
+            }
+            vram[py & 511][px & 1023] = c;
+        }
+    }
+}
+
+static void tell_rect(int x, int y, int w, int h, int r, int g, int b, int area[4], int set_mask) {
+    GpuEvent ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = GPU_EV_RECT;
+    ev.x = x;
+    ev.y = y;
+    ev.w = w;
+    ev.h = h;
+    ev.v[0].x = x;
+    ev.v[0].y = y;
+    ev.v[0].r = r;
+    ev.v[0].g = g;
+    ev.v[0].b = b;
+    ev.area_x0 = area[0];
+    ev.area_y0 = area[1];
+    ev.area_x1 = area[2];
+    ev.area_y1 = area[3];
+    ev.set_mask = set_mask;
+    render_gles_feed(&ev);
 }
 
 static void tell(GpuEventKind kind, int x, int y, int w, int h, int set_mask, int check_mask) {
@@ -154,7 +208,7 @@ int main(void) {
     int ok = 1, i, j;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("GLES renderer self-test (M1: the transfer path against the shim's VRAM)\n");
+    printf("GLES renderer self-test (M1 transfers, M2 rectangles, against the shim's VRAM)\n");
     printf("opening the EGL/GBM context...\n");
     if (!render_gles_open(why, sizeof(why))) {
         printf("FAIL: no renderer: %s\n", why);
@@ -213,7 +267,34 @@ int main(void) {
     render_gles_frame();
     ok &= compare("LoadImage with set-mask");
 
-    /* 6. Nothing drawn by the CPU: the polygons are counted, not pretended (M2/M3 own them). */
+    /* 6. M2: untextured rectangles. The risky part is the coordinate mapping (the row order and the half-pixel
+     * offset), which a wrong sign or a missing 0.5 turns into a one-pixel shift the comparison cannot miss. */
+    {
+        int full[4] = {0, 0, 1023, 511};
+
+        sw_rect(200, 300, 100, 50, 255, 0, 0, full, 0);
+        tell_rect(200, 300, 100, 50, 255, 0, 0, full, 0);
+        render_gles_frame();
+        ok &= compare("Rect 100x50 red");
+
+        /* A rectangle clipped by the drawing area: only the part inside it is drawn. */
+        {
+            int area[4] = {100, 100, 199, 199};
+
+            sw_rect(150, 150, 100, 100, 0, 255, 0, area, 0);
+            tell_rect(150, 150, 100, 100, 0, 255, 0, area, 0);
+        }
+        render_gles_frame();
+        ok &= compare("Rect clipped to the area");
+
+        /* Set-mask: every pixel drawn carries the mask bit. */
+        sw_rect(500, 400, 16, 16, 0, 0, 255, full, 1);
+        tell_rect(500, 400, 16, 16, 0, 0, 255, full, 0x8000);
+        render_gles_frame();
+        ok &= compare("Rect with set-mask");
+    }
+
+    /* 7. Nothing drawn by the CPU: the polygons are counted, not pretended (M3/M4 own them). */
     {
         GpuEvent ev;
 
@@ -225,6 +306,7 @@ int main(void) {
            render_gles_undrawn(GPU_EV_RECT), render_gles_undrawn(GPU_EV_SEGMENT));
 
     render_gles_close();
-    printf("\n%s\n", ok ? "PASS: every transfer reproduced the shim's VRAM exactly" : "FAIL: see the diffs above");
+    printf("\n%s\n", ok ? "PASS: every transfer and rectangle reproduced the shim's VRAM exactly"
+                            : "FAIL: see the diffs above");
     return ok ? 0 : 1;
 }

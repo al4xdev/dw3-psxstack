@@ -605,6 +605,7 @@ static FbdevPresent fbdev;
 static int fbdev_active;
 #ifdef PSXSTACK_EGL
 static int video_gles; /* the offscreen GLES renderer draws; the present still comes out through fbdev */
+static long video_gles_check_every; /* DW3_GLES_CHECK: frames between VRAM comparisons, 0 off */
 /* The display area as the renderer reads it back: 320x240 of 16-bit pixels, presented by Fbdev_PresentVram. */
 static u16 video_gles_display[VIDEO_MAX_W * VIDEO_MAX_H];
 #endif
@@ -640,10 +641,22 @@ void port_video_open(int scale, int fullscreen) {
                  * this handheld, the fb0 present 0.77 ms: docs/gpu/measurements.txt). */
                 char gles_why[160] = {0};
 
+                const char *replace_env = getenv("DW3_GLES_REPLACE");
+                const char *check_env = getenv("DW3_GLES_CHECK");
+
+                /* DW3_GLES_REPLACE=0 keeps the CPU drawing as well, so the VRAM check can compare the two.
+                 * DW3_GLES_CHECK=N compares the whole target against the shim's VRAM every N frames and logs the
+                 * first differing pixel. Both are measurement switches, not settings. */
+                video_gles_check_every = check_env != NULL ? atoi(check_env) : 0;
+                if (replace_env != NULL && replace_env[0] == '0') {
+                    render_gles_set_replace(0);
+                }
                 if (render_gles_open(gles_why, sizeof(gles_why)) &&
                     render_gles_raster_start(1, gles_why, sizeof(gles_why))) {
                     video_gles = 1;
-                    port_log("renderer: gles (%s)", render_gles_describe());
+                    port_log("renderer: gles (%s)%s%s", render_gles_describe(),
+                             video_gles_check_every > 0 ? ", vram check every " : "",
+                             video_gles_check_every > 0 ? check_env : "");
                 } else {
                     port_log("renderer: gles unavailable (%s); the software renderer draws", gles_why);
                 }
@@ -979,6 +992,57 @@ static int video_present_direct(long long *t0) {
 }
 #endif
 
+#if defined(PSXSTACK_SDL2) && defined(PSXSTACK_EGL)
+/* DW3_GLES_CHECK: the whole GLES target against the shim's VRAM, the plan's exactness criterion made a live measure.
+ * With DW3_GLES_REPLACE=0 the CPU draws the same primitives, so every difference is a bug in the renderer rather than
+ * a milestone that has not landed yet. */
+static void video_gles_vram_check(void) {
+    static u16 hw[1024 * 512];
+    static long checks, failed;
+
+    if (!video_gles || video_gles_check_every <= 0 || port_frames % video_gles_check_every != 0) {
+        return;
+    }
+    if (!render_gles_read_vram(hw)) {
+        return;
+    }
+    {
+        const u16 *sw = psyq_gpu_vram();
+        int stride = psyq_gpu_vram_stride();
+        int x, y, diffs = 0, fx = -1, fy = -1;
+        u16 fsw = 0, fhw = 0;
+
+        for (y = 0; y < 512; y++) {
+            for (x = 0; x < 1024; x++) {
+                u16 a = sw[(size_t)y * stride + x];
+                u16 b = hw[(size_t)y * 1024 + x];
+
+                if (a != b) {
+                    if (diffs == 0) {
+                        fx = x;
+                        fy = y;
+                        fsw = a;
+                        fhw = b;
+                    }
+                    diffs++;
+                }
+            }
+        }
+        checks++;
+        if (diffs == 0) {
+            port_log("gles: vram check %ld (frame %ld): exact", checks, port_frames);
+        } else {
+            failed++;
+            port_log("gles: vram check %ld (frame %ld): %.1f%% of the VRAM differs (%d pixels), first at %d,%d"
+                     " sw 0x%04x hw 0x%04x; the undrawn counters say what is missing (triangles %u, rects %u,"
+                     " segments %u)",
+                     checks, port_frames, 100.0 * (double)diffs / (1024.0 * 512.0), diffs, fx, fy, fsw, fhw,
+                     render_gles_undrawn(0), render_gles_undrawn(1), render_gles_undrawn(2));
+        }
+    }
+}
+#endif
+
 void port_video_frame(void) {
     int i, shot = 0, present;
     long long present_t0 = 0;
@@ -986,6 +1050,10 @@ void port_video_frame(void) {
     render_gpu_frame(); /* the rasteriser's units of this vsync, presented or not: its target is state */
     render_gpu_tex_frame();
     video_vram_check();
+#endif
+#if defined(PSXSTACK_SDL2) && defined(PSXSTACK_EGL)
+    render_gles_frame();
+    video_gles_vram_check();
 #endif
     for (i = 0; i < video_shot_count; i++) {
         shot |= video_shots[i].frame == port_frames;
