@@ -1324,9 +1324,28 @@ unsigned long long port_gpu_cycles(void) {
 #endif
 }
 
+/* DW3_SKIP_BIG=N: draw no triangle whose bounding box covers more than N pixels, to weigh a scene's background (the
+ * battle's arena is a few screen-sized textured quads). A measurement switch: the picture is wrong on purpose. */
+static int gpu_skip_big = -1;
+
 static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud);
 
 static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud) {
+    if (gpu_skip_big < 0) {
+        const char *env = getenv("DW3_SKIP_BIG");
+
+        gpu_skip_big = env != NULL ? atoi(env) : 0;
+    }
+    if (gpu_skip_big > 0) {
+        int x0 = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
+        int x1 = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
+        int y0 = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
+        int y1 = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+
+        if ((long)(x1 - x0) * (y1 - y0) > gpu_skip_big) {
+            return;
+        }
+    }
     if (port_gpu_log_on) {
         unsigned long long t0 = port_gpu_cycles();
 

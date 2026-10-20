@@ -333,6 +333,15 @@ void port_audio_open(int device, const char *wav_path) {
 void port_audio_frame(void) {
     long long n = audio_vsync;
     int frames = (int)((n + 1) * SPU_RATE / audio_rate - n * SPU_RATE / audio_rate);
+    /* <PREFIX>_NO_AUDIO=1: the mix is not run at all and silence is played, to weigh its share of a frame. A
+     * measurement switch, not a setting: the voices' state stops advancing, so nothing else can be judged with it. */
+    static int no_audio = -1;
+
+    if (no_audio < 0) {
+        const char *env = getenv(PSXSTACK_GAME_ENV_PREFIX "_NO_AUDIO");
+
+        no_audio = env != NULL && env[0] == '1';
+    }
     port_phase_begin(PORT_PHASE_AUDIO);
     {
         /* DW3_GPU_LOG counts the mix's share of the frame too (psyq/gpu.c). */
@@ -341,7 +350,11 @@ void port_audio_frame(void) {
         extern void port_gpu_log_audio(unsigned long long cycles);
         unsigned long long t0 = port_gpu_log_on ? port_gpu_cycles() : 0;
 
-        spu_render(audio_buf, frames);
+        if (no_audio) {
+            memset(audio_buf, 0, (size_t)frames * 4);
+        } else {
+            spu_render(audio_buf, frames);
+        }
         if (t0 != 0) {
             port_gpu_log_audio(port_gpu_cycles() - t0);
         }
