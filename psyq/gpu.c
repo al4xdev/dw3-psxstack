@@ -576,6 +576,16 @@ GPU_INLINE void gpu_interp_step(Interp *it, int d) {
     }
 }
 
+/* The vector spans' escape hatches (DW3_NO_NEON_GOURAUD=1, DW3_NO_NEON_FLAT=1): the scalar path, to time the two on
+ * one build and to recover from a vector path that misbehaves without a rebuild. */
+static int gpu_neon_gouraud_off = -1;
+static int gpu_neon_flat_off = -1;
+static unsigned gpu_log_neon_spans;   /* spans drawn by the vector paths (DW3_GPU_LOG) */
+static unsigned gpu_log_scalar_spans; /* spans drawn by the scalar ones */
+static unsigned gpu_log_flat_opaque;  /* flat spans the vector path could take (opaque and textured) */
+static unsigned gpu_log_gour_ok;      /* Gouraud spans that could too (opaque, undithered, textured) */
+static unsigned gpu_log_alias_spans;  /* spans the self-aliasing check sent to the scalar path */
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 /* Can this span's textured pixels come from the very row it writes? The scalar loops read a texel and write its
  * pixel one at a time, so a triangle that draws over its own texture sees its own writes. The vector loop fetches
@@ -596,12 +606,14 @@ static int gpu_span_row_clear(const Mode *m, int y, int n, const Interp *iv, int
     return dy < r0 && dy > r1;
 }
 
-/* A span of a one-colour textured triangle whose blend is opaque: gpu_shade_flat's `blend == GPU_OPAQUE` branch,
- * eight pixels at a time. The texels are still fetched one by one (ARMv7 has no gather); the modulation, the
- * clamp to 31 and the packing are vector. Every value is exact 16-bit arithmetic, so the pixels are the scalar
- * loop's. A texel of 0 leaves the destination alone, as `continue` does there. */
+/* A span of a one-colour textured triangle, eight pixels at a time: gpu_shade_flat's three tex branches, which are
+ * the game's whole textured drawing. GPU_COPY (colour 128,128,128: the texel as it is) is what the field's and the
+ * battle's drawing use; GPU_OPAQUE modulates; a semi-transparent primitive (mode 0 average, 2 subtract, 1 and 3 add)
+ * blends with the destination. The texels are still fetched one by one (ARMv7 has no gather); the rest is vector,
+ * exact 16-bit arithmetic, so the pixels are the scalar loop's. A texel of 0 leaves the destination alone, as
+ * `continue` does there. */
 GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp *iu, Interp *iv, int au, int av,
-                                   int d, int r, int gg, int b, const int depth) {
+                                   int d, int r, int gg, int b, const int depth, const int blend) {
     const u16 *clut = &gpu_vram[m->clut_y * VRAM_W];
     const int tex_x = m->tex_x, tex_y = m->tex_y, clut_x = m->clut_x;
     const int u_and = m->u_and, u_or = m->u_or, v_and = m->v_and, v_or = m->v_or;
@@ -649,16 +661,53 @@ GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp
             gpu_interp_step(iv, d);
         }
         tt = vld1q_u16(t);
-        tr = vandq_u16(tt, v31);
-        tg = vandq_u16(vshrq_n_u16(tt, 5), v31);
-        tb = vandq_u16(vshrq_n_u16(tt, 10), v31);
-        fr = vminq_u16(vshrq_n_u16(vmulq_u16(tr, vr), 7), v31);
-        fg = vminq_u16(vshrq_n_u16(vmulq_u16(tg, vg), 7), v31);
-        fb = vminq_u16(vshrq_n_u16(vmulq_u16(tb, vb), 7), v31);
-        out = vorrq_u16(vorrq_u16(fr, vshlq_n_u16(fg, 5)), vshlq_n_u16(fb, 10));
-        out = vorrq_u16(vorrq_u16(out, vandq_u16(tt, vstp)), vmask);
-        zero = vceqq_u16(tt, vdupq_n_u16(0));
         dq = vld1q_u16(dst + i);
+        zero = vceqq_u16(tt, vdupq_n_u16(0));
+        if (blend == GPU_COPY) {
+            /* gpu_shade_flat's GPU_COPY branch: the texel and the mask bit, nothing else. */
+            out = vorrq_u16(tt, vmask);
+        } else {
+            tr = vandq_u16(tt, v31);
+            tg = vandq_u16(vshrq_n_u16(tt, 5), v31);
+            tb = vandq_u16(vshrq_n_u16(tt, 10), v31);
+            if (blend == 3) { /* mode 3 quarters the colour before adding it */
+                tr = vshrq_n_u16(tr, 2);
+                tg = vshrq_n_u16(tg, 2);
+                tb = vshrq_n_u16(tb, 2);
+            }
+            fr = vminq_u16(vshrq_n_u16(vmulq_u16(tr, vr), 7), v31);
+            fg = vminq_u16(vshrq_n_u16(vmulq_u16(tg, vg), 7), v31);
+            fb = vminq_u16(vshrq_n_u16(vmulq_u16(tb, vb), 7), v31);
+            out = vorrq_u16(vorrq_u16(fr, vshlq_n_u16(fg, 5)), vshlq_n_u16(fb, 10));
+            out = vorrq_u16(vorrq_u16(out, vandq_u16(tt, vstp)), vmask);
+            if (blend >= 0) {
+                /* gpu_shade_flat's blend: the texel's STP bit picks it over the plain modulation above. */
+                uint16x8_t dr = vandq_u16(dq, v31), dg = vandq_u16(vshrq_n_u16(dq, 5), v31);
+                uint16x8_t db = vandq_u16(vshrq_n_u16(dq, 10), v31);
+                uint16x8_t br, bg, bb, bl;
+
+                if (blend == 0) { /* average */
+                    br = vshrq_n_u16(vaddq_u16(dr, fr), 1);
+                    bg = vshrq_n_u16(vaddq_u16(dg, fg), 1);
+                    bb = vshrq_n_u16(vaddq_u16(db, fb), 1);
+                } else if (blend == 2) { /* subtract, clamped to 0 (gpu_clamp) */
+                    int16x8_t sr = vsubq_s16(vreinterpretq_s16_u16(dr), vreinterpretq_s16_u16(fr));
+                    int16x8_t sg = vsubq_s16(vreinterpretq_s16_u16(dg), vreinterpretq_s16_u16(fg));
+                    int16x8_t sb = vsubq_s16(vreinterpretq_s16_u16(db), vreinterpretq_s16_u16(fb));
+
+                    br = vreinterpretq_u16_s16(vmaxq_s16(sr, vdupq_n_s16(0)));
+                    bg = vreinterpretq_u16_s16(vmaxq_s16(sg, vdupq_n_s16(0)));
+                    bb = vreinterpretq_u16_s16(vmaxq_s16(sb, vdupq_n_s16(0)));
+                } else { /* add, clamped to 31 */
+                    br = vminq_u16(vaddq_u16(dr, fr), v31);
+                    bg = vminq_u16(vaddq_u16(dg, fg), v31);
+                    bb = vminq_u16(vaddq_u16(db, fb), v31);
+                }
+                bl = vorrq_u16(vorrq_u16(br, vshlq_n_u16(bg, 5)), vshlq_n_u16(bb, 10));
+                bl = vorrq_u16(vorrq_u16(bl, vandq_u16(tt, vstp)), vmask);
+                out = vbslq_u16(vtstq_u16(tt, vstp), bl, out);
+            }
+        }
         vst1q_u16(dst + i, vbslq_u16(zero, dq, out));
     }
     for (; i < n; i++) {
@@ -668,7 +717,7 @@ GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp
         gpu_interp_step(iu, d);
         gpu_interp_step(iv, d);
         if (t != 0) {
-            gpu_shade_flat(&dst[i], t, r, gg, b, set_mask, 1, GPU_OPAQUE);
+            gpu_shade_flat(&dst[i], t, r, gg, b, set_mask, 1, blend == GPU_COPY ? GPU_COPY : blend);
         }
     }
 }
@@ -684,11 +733,27 @@ GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int y, int n, Interp 
     int i;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    if (blend == GPU_OPAQUE && depth != 0 && gpu_span_row_clear(m, y, n, &iv, av)) {
-        gpu_span_flat_neon(m, dst, y, n, &iu, &iv, au, av, d, r, gg, b, depth);
-        return;
+    if (depth != 0) {
+        if (port_gpu_log_on) {
+            gpu_log_flat_opaque++;
+        }
+        if (!gpu_neon_flat_off && gpu_span_row_clear(m, y, n, &iv, av)) {
+            if (port_gpu_log_on) {
+                gpu_log_neon_spans++;
+            }
+            gpu_span_flat_neon(m, dst, y, n, &iu, &iv, au, av, d, r, gg, b, depth, blend);
+            return;
+        }
+        if (port_gpu_log_on) {
+            gpu_log_alias_spans++;
+        }
     }
+#else
+    (void)y; /* only the vector path's aliasing check looks at the row */
 #endif
+    if (port_gpu_log_on) {
+        gpu_log_scalar_spans++;
+    }
     for (i = 0; i < n; i++) {
         u16 t = 0;
 
@@ -708,9 +773,6 @@ GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int y, int n, Interp 
 
 /* A span of a Gouraud triangle starting at (x, y): it[0..2] the colour's interpolators, it[3..4] the texture's.
  * Textured spans of the plain pipeline (not dithered, not semi-transparent) take their colour per pair of pixels. */
-/* DW3_NO_NEON_GOURAUD=1: the scalar Gouraud span (an escape hatch for a vector-path crash). */
-static int gpu_neon_gouraud_off = -1;
-
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 /* The plain textured Gouraud span (not dithered, not semi-transparent: the battle's models), eight pixels at a
  * time. The colours and the texels are still taken one by one (the colour interpolation is sequential and ARMv7
@@ -827,11 +889,25 @@ GPU_INLINE void gpu_span_gouraud_tri(const Mode *m, u16 *dst, int x, int y, int 
     int i;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    if (depth != 0 && !eight && !semi && !gpu_neon_gouraud_off && gpu_span_row_clear(m, y, n, &iv, av)) {
-        gpu_span_gouraud_neon(m, dst, y, n, it, a, d);
-        return;
+    if (depth != 0 && !eight && !semi) {
+        if (port_gpu_log_on) {
+            gpu_log_gour_ok++;
+        }
+        if (!gpu_neon_gouraud_off && gpu_span_row_clear(m, y, n, &iv, av)) {
+            if (port_gpu_log_on) {
+                gpu_log_neon_spans++;
+            }
+            gpu_span_gouraud_neon(m, dst, y, n, it, a, d);
+            return;
+        }
+        if (port_gpu_log_on) {
+            gpu_log_alias_spans++;
+        }
     }
 #endif
+    if (port_gpu_log_on) {
+        gpu_log_scalar_spans++;
+    }
     for (i = 0; i < n; i++) {
         u16 t = 0;
 
@@ -1203,27 +1279,33 @@ static void gpu_gouraud_tri(int kind, const Mode *m, u16 *dst, int x, int y, int
  * starts its attributes with one division and steps them per pixel. */
 /* Textured pixels by depth (4-bit, 8-bit, 15-bit): the span counter's companion (DW3_GPU_LOG, at the end). */
 static unsigned gpu_log_depth[3];
-static long long gpu_log_flat, gpu_log_gour; /* ns inside the span loops, flat and Gouraud */
-static long long gpu_log_tri;                /* ns inside gpu_triangle: the spans plus its setup */
-static unsigned gpu_log_spans;               /* spans (triangle rows) drawn */
+static unsigned long long gpu_log_flat, gpu_log_gour; /* cycles inside the span loops, flat and Gouraud */
+static unsigned long long gpu_log_tri; /* cycles inside gpu_triangle: the spans plus its setup */
+static unsigned long long gpu_log_walk; /* cycles inside the order-list walk: the triangles plus the dispatch */
+static unsigned long long gpu_log_pkt; /* cycles inside gpu_gp0_write: the triangles plus every other primitive */
+static unsigned long long gpu_log_row; /* cycles from a row's attribute setup to its gpu_touch, spans excluded */
+static unsigned long long gpu_log_tset; /* cycles of a triangle's setup, before its first row */
+static unsigned long long gpu_log_pre; /* cycles of a row's preamble: the edges' x, the side test, the clipping */
+static unsigned long long gpu_log_mask; /* cycles of the mask-checked spans (gpu_pixel, one pixel at a time) */
+static unsigned gpu_log_mask_px;        /* their pixels */
+static unsigned gpu_log_load_px;        /* pixels of the CPU-to-VRAM transfers (LoadImage) */
+static unsigned gpu_log_spans;          /* spans (triangle rows) drawn */
 
-/* A few cycles, not a clock_gettime: this runs twice per span. The ARM virtual counter is readable from EL0 on
- * this kernel; the frequency is calibrated against the monotonic clock once. */
-static double gpu_log_ns_per_cycle;
+/* A cycle is a nanosecond off an ARM host (the clock is the monotonic one there). On the handheld the ARM virtual
+ * counter is readable from EL0 and its frequency is calibrated against the monotonic clock once. */
+static double gpu_log_ns_per_cycle = 1.0;
 
-static long long gpu_log_now(void) {
+unsigned long long port_gpu_cycles(void) {
 #if defined(__arm__)
     unsigned int lo, hi;
-    unsigned long long c;
 
     asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
-    c = ((unsigned long long)hi << 32) | lo;
-    return (long long)((double)c * gpu_log_ns_per_cycle);
+    return ((unsigned long long)hi << 32) | lo;
 #else
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
 #endif
 }
 
@@ -1231,10 +1313,10 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
 
 static void gpu_triangle(const Mode *m, const Vertex *a, const Vertex *b, const Vertex *c, int gouraud) {
     if (port_gpu_log_on) {
-        long long t0 = gpu_log_now();
+        unsigned long long t0 = port_gpu_cycles();
 
         gpu_triangle_body(m, a, b, c, gouraud);
-        gpu_log_tri += gpu_log_now() - t0;
+        gpu_log_tri += port_gpu_cycles() - t0;
         return;
     }
     gpu_triangle_body(m, a, b, c, gouraud);
@@ -1244,12 +1326,13 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
     const Vertex *v[3] = { a, b, c };
     const Vertex *t;
     const Vertex *s0 = NULL;
-    s64 den, n[5][2], lnum, snum = 0;
+    s64 den, n[5][2], lnum, snum = 0, cross = 0, dcross = 0;
     int d2, lden, ldx, sden = 0, sdx = 0;
     int nattr, pairs, first, kind, seg;
     int y, ymin, ymax, i;
     int dx1, dy1, dx2, dy2;
     Interp it[5], el, es;
+    unsigned long long set0 = port_gpu_log_on ? port_gpu_cycles() : 0;
 
     /* The size limit: no edge longer than 1023 horizontally or 511 vertically. */
     if (abs(a->x - b->x) > 1023 || abs(a->x - c->x) > 1023 || abs(b->x - c->x) > 1023 || abs(a->y - b->y) > 511
@@ -1330,11 +1413,16 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
     lnum = (s64)v[0]->x * lden + (s64)(ymin - v[0]->y) * ldx;
     gpu_interp_start(&el, -lnum, -ldx, lden);
     seg = -1;
+    if (port_gpu_log_on) {
+        gpu_log_tset += port_gpu_cycles() - set0;
+    }
     for (y = ymin; y < ymax; y++) {
         int upper = y < v[1]->y;
         s64 xl, xr, x0, x1;
         int x, xs, xe;
         int cr = a->r, cg = a->g, cb = a->b;
+        unsigned long long row0 = 0;
+        unsigned long long pre0 = port_gpu_log_on ? port_gpu_cycles() : 0;
 
         if (upper != seg) {
             const Vertex *s1 = upper ? v[1] : v[2];
@@ -1343,6 +1431,10 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
             sden = s1->y - s0->y;
             sdx = s1->x - s0->x;
             snum = (s64)s0->x * sden + (s64)(y - s0->y) * sdx;
+            /* Which side the long edge is on: cross = lnum * sden - snum * lden, stepped a row at a time (lnum += ldx,
+             * snum += sdx) instead of multiplied out per row. */
+            cross = lnum * sden - snum * lden;
+            dcross = ldx * sden - sdx * lden;
             if (sden != 0) {
                 gpu_interp_start(&es, -snum, -sdx, sden);
             }
@@ -1353,8 +1445,7 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
         }
         x0 = -el.q; /* ceil(lnum / lden) */
         x1 = -es.q; /* ceil(snum / sden) */
-        /* Which side the long edge is on: compare the edges' positions (as fractions) at this row. */
-        if (lnum * sden < snum * lden) {
+        if (cross < 0) {
             xl = x0, xr = x1;
         } else {
             xl = x1, xr = x0;
@@ -1371,10 +1462,17 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
             }
             goto next;
         }
+        if (port_gpu_log_on) {
+            row0 = port_gpu_cycles();
+            gpu_log_pre += row0 - pre0;
+        }
         for (i = first; i < nattr; i++) {
             gpu_interp_at(&it[i], 2 * ((s64)(xs - a->x) * n[i][0] + (s64)(y - a->y) * n[i][1]) + den, d2);
         }
         gpu_touch(y, xs, xe);
+        if (port_gpu_log_on) {
+            gpu_log_row += port_gpu_cycles() - row0;
+        }
         if (!g.check_mask) {
             if (port_gpu_log_on) {
                 int k = 1;
@@ -1390,28 +1488,31 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
                 port_gpu_log_span(k, xe - xs);
             }
             if (gouraud) {
-                long long t0 = 0;
+                unsigned long long t0 = 0;
 
                 if (port_gpu_log_on) {
-                    t0 = gpu_log_now();
+                    t0 = port_gpu_cycles();
                 }
                 gpu_gouraud_tri(kind, m, &gpu_vram[y * VRAM_W + xs], xs, y, xe - xs, it, a, d2);
                 if (port_gpu_log_on) {
-                    gpu_log_gour += gpu_log_now() - t0;
+                    gpu_log_gour += port_gpu_cycles() - t0;
                 }
             } else {
-                long long t0 = 0;
+                unsigned long long t0 = 0;
 
                 if (port_gpu_log_on) {
-                    t0 = gpu_log_now();
+                    t0 = port_gpu_cycles();
                 }
                 gpu_flat_tri(kind, m, &gpu_vram[y * VRAM_W + xs], y, xe - xs, it, a->u, a->v, d2, a->r, a->g, a->b);
                 if (port_gpu_log_on) {
-                    gpu_log_flat += gpu_log_now() - t0;
+                    gpu_log_flat += port_gpu_cycles() - t0;
                 }
             }
             goto next;
         }
+        {
+        unsigned long long m0 = port_gpu_log_on ? port_gpu_cycles() : 0;
+
         for (x = xs; x < xe; x++) {
             int u = 0, vv = 0;
 
@@ -1429,9 +1530,16 @@ static void gpu_triangle_body(const Mode *m, const Vertex *a, const Vertex *b, c
                 gpu_interp_step(&it[i], d2);
             }
         }
+        if (port_gpu_log_on) {
+            /* The mask-checked spans (gpu_pixel, the one-pixel-at-a-time path): the rest of a triangle's pixels. */
+            gpu_log_mask += port_gpu_cycles() - m0;
+            gpu_log_mask_px += (unsigned)(xe - xs);
+        }
+        }
     next:
         lnum += ldx;
         snum += sdx;
+        cross += dcross;
         gpu_interp_step(&el, lden);
         if (sden != 0) {
             gpu_interp_step(&es, sden);
@@ -1923,7 +2031,9 @@ static void gpu_execute_body(void) {
     }
 }
 
-void gpu_gp0_write(u32 word) {
+/* Every GP0 word, the drawing it triggers included: DW3_GPU_LOG times this and the triangles inside it, so the
+ * difference is what is neither a triangle nor the walk (fills, VRAM copies, sprites, lines, uploads). */
+static void gpu_gp0_write_body(u32 word) {
     if (g.load_left > 0) {
         gpu_load_pixel((u16)word);
         if (g.load_left > 0) {
@@ -1970,6 +2080,17 @@ void gpu_gp0_write(u32 word) {
     }
 }
 
+void gpu_gp0_write(u32 word) {
+    if (port_gpu_log_on) {
+        unsigned long long t0 = port_gpu_cycles();
+
+        gpu_gp0_write_body(word);
+        gpu_log_pkt += port_gpu_cycles() - t0;
+        return;
+    }
+    gpu_gp0_write_body(word);
+}
+
 void gpu_gp0_words(const u32 *w, u32 n) {
     u32 i;
 
@@ -1982,7 +2103,7 @@ void gpu_gp0_words(const u32 *w, u32 n) {
 
 /* CPU to VRAM in one go (LoadImage): GP0 A0h, the rectangle, then the pixels (two per word, the last word's high
  * half unused when the count is odd). */
-void gpu_load_image(int x, int y, int w, int h, const u16 *pixels) {
+static void gpu_load_image_body(int x, int y, int w, int h, const u16 *pixels) {
     int i, n;
 
     gpu_gp0_write(0xA0000000u);
@@ -2019,18 +2140,33 @@ void gpu_load_image(int x, int y, int w, int h, const u16 *pixels) {
     port_phase_end();
 }
 
+/* A whole CPU-to-VRAM transfer, timed apart from the words above (its pixel loop is the bulk of it). */
+void gpu_load_image(int x, int y, int w, int h, const u16 *pixels) {
+    if (port_gpu_log_on) {
+        unsigned long long t0 = port_gpu_cycles();
+
+        gpu_load_image_body(x, y, w, h, pixels);
+        gpu_log_pkt += port_gpu_cycles() - t0;
+        gpu_log_load_px += (unsigned)(w > 0 && h > 0 ? w * h : 0);
+        return;
+    }
+    gpu_load_image_body(x, y, w, h, pixels);
+}
+
 /* DW3_GPU_LOG: pixel mix and ordering-table time, one line a second. Off is one load per span. */
 int port_gpu_log_on;
 static unsigned gpu_log_pix[7];
-static long long gpu_log_ns, gpu_log_sec;
+static long long gpu_log_sec;
 static int gpu_log_frames;
 static FILE *gpu_log_file;
 
 void port_gpu_log_init(void) {
     const char *env = getenv("DW3_GPU_LOG");
     const char *nogour = getenv("DW3_NO_NEON_GOURAUD");
+    const char *noflat = getenv("DW3_NO_NEON_FLAT");
 
     gpu_neon_gouraud_off = nogour != NULL && nogour[0] == '1';
+    gpu_neon_flat_off = noflat != NULL && noflat[0] == '1';
     if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0) {
         return;
     }
@@ -2038,19 +2174,16 @@ void port_gpu_log_init(void) {
 #if defined(__arm__)
     {
         struct timespec a, b;
-        unsigned int lo, hi;
         unsigned long long c0, c1;
         long long ns;
 
         clock_gettime(CLOCK_MONOTONIC, &a);
-        asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
-        c0 = ((unsigned long long)hi << 32) | lo;
+        c0 = port_gpu_cycles();
         do {
             clock_gettime(CLOCK_MONOTONIC, &b);
             ns = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec);
         } while (ns < 2000000);
-        asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
-        c1 = ((unsigned long long)hi << 32) | lo;
+        c1 = port_gpu_cycles();
         gpu_log_ns_per_cycle = (double)ns / (double)(c1 - c0);
     }
 #endif
@@ -2066,10 +2199,8 @@ void port_gpu_log_span(int kind, int pixels) {
     }
 }
 
-void port_gpu_log_walk(long long ns) {
-    if (ns > 0) {
-        gpu_log_ns += ns;
-    }
+void port_gpu_log_walk(unsigned long long cycles) {
+    gpu_log_walk += cycles;
 }
 
 void port_gpu_log_frame(void) {
@@ -2093,7 +2224,7 @@ void port_gpu_log_frame(void) {
         return;
     }
     n = gpu_log_frames > 0 ? (double)gpu_log_frames : 1.0;
-    snprintf(line, sizeof line, "gpu: %.1f ms", (double)gpu_log_ns / n / 1e6);
+    snprintf(line, sizeof line, "gpu: %.1f ms", (double)gpu_log_walk * gpu_log_ns_per_cycle / n / 1e6);
     for (i = 0; i < 7; i++) {
         char bit[40];
         size_t used = strlen(line);
@@ -2104,10 +2235,22 @@ void port_gpu_log_frame(void) {
         }
     }
     snprintf(line + strlen(line), sizeof line - strlen(line),
-             " | depth4 %.0f depth8 %.0f depth15 %.0f | flat %.1f ms gour %.1f ms tri %.1f ms spans %.0f", 
+             " | depth4 %.0f depth8 %.0f depth15 %.0f | walk %.1f ms pkt %.1f ms tri %.1f ms tset %.1f ms row %.1f ms"
+             " flat %.1f ms gour %.1f ms mask %.1f ms pre %.1f ms | spans %.0f neon %.0f scal %.0f fopq %.0f gok %.0f"
+             " alias %.0f maskpx %.0f load %.0f",
              (double)gpu_log_depth[0] / n, (double)gpu_log_depth[1] / n, (double)gpu_log_depth[2] / n,
-             (double)gpu_log_flat / n / 1e6, (double)gpu_log_gour / n / 1e6, (double)gpu_log_tri / n / 1e6,
-             (double)gpu_log_spans / n);
+             (double)gpu_log_walk * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_pkt * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_tri * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_tset * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_row * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_flat * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_gour * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_mask * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_pre * gpu_log_ns_per_cycle / n / 1e6,
+             (double)gpu_log_spans / n, (double)gpu_log_neon_spans / n, (double)gpu_log_scalar_spans / n,
+             (double)gpu_log_flat_opaque / n, (double)gpu_log_gour_ok / n, (double)gpu_log_alias_spans / n,
+             (double)gpu_log_mask_px / n, (double)gpu_log_load_px / n);
     if (gpu_log_file != NULL) {
         fprintf(gpu_log_file, "%s\n", line);
         fflush(gpu_log_file);
@@ -2116,8 +2259,20 @@ void port_gpu_log_frame(void) {
     memset(gpu_log_depth, 0, sizeof gpu_log_depth);
     gpu_log_flat = gpu_log_gour = 0;
     gpu_log_tri = 0;
+    gpu_log_walk = 0;
+    gpu_log_pkt = 0;
+    gpu_log_row = 0;
+    gpu_log_tset = 0;
+    gpu_log_mask = 0;
+    gpu_log_pre = 0;
+    gpu_log_mask_px = 0;
+    gpu_log_neon_spans = 0;
+    gpu_log_scalar_spans = 0;
+    gpu_log_flat_opaque = 0;
+    gpu_log_gour_ok = 0;
+    gpu_log_alias_spans = 0;
+    gpu_log_load_px = 0;
     gpu_log_spans = 0;
-    gpu_log_ns = 0;
     gpu_log_frames = 0;
     gpu_log_sec = now;
 }

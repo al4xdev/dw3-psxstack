@@ -245,6 +245,8 @@ static int fb_xrgb8(const FbdevPresent *fb) {
            fb->blue_offset == 0 && fb->blue_length == 8;
 }
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+/* A row's tail (n not a multiple of eight) and the 24-bit rows' tail: a 5-bit channel expands to 8 as (c << 3) | (c >> 2). */
 static uint32_t fb_pix15(uint16_t c) {
     uint32_t r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
     r = (r << 3) | (r >> 2);
@@ -262,7 +264,6 @@ static void fb_store_pair(uint32_t *dst, uint32_t *dst2, int i, uint32_t p) {
     }
 }
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
 static void fb_store_2x8(uint8x8_t b, uint8x8_t g, uint8x8_t r, uint32_t *dst, uint32_t *dst2) {
     uint16x8_t gb = vorrq_u16(vmovl_u8(b), vshlq_n_u16(vmovl_u8(g), 8));
     uint16x8_t rr = vmovl_u8(r);
@@ -319,8 +320,6 @@ static void fb_row24_neon(const uint8_t *src, int n, uint32_t *dst, uint32_t *ds
 #endif
 
 int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int w, int h, int rgb24) {
-    int sx, sy, dst_x, dst_y, row, copy_h, src_y_off;
-
     if (Fbdev_Validate(fb, NULL, 0) < 0 || !vram || w <= 0 || h <= 0) {
         return -1;
     }
@@ -329,21 +328,22 @@ int Fbdev_PresentVram(FbdevPresent *fb, const uint16_t *vram, int x, int y, int 
     if (!fb_xrgb8(fb) || w > 320 || h > 576 || w * 2 > (int)fb->xres) {
         return -1;
     }
-    sx = x & 1023;
-    sy = y & 511;
+#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
+    /* The expand is the NEON one: without it video.c converts and calls Fbdev_Present. */
+    (void)x;
+    (void)y;
+    (void)rgb24;
+    return -1;
+#else
+    int sx = x & 1023, sy = y & 511, dst_x, dst_y, row, copy_h, src_y_off;
+    int scale_y = h <= 256 ? 2 : 1;
+
     if (sx + w > 1024) {
         return -1;
     }
     if (rgb24 && sx * 2 + w * 3 > 2048) {
         return -1;
     }
-#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
-    (void)fbdev_cleared_w;
-    (void)fbdev_cleared_h;
-    return -1;
-#else
-    int scale_y = h <= 256 ? 2 : 1;
-
     dst_x = ((int)fb->xres - w * 2) / 2;
     dst_y = ((int)fb->yres - h * scale_y) / 2;
     src_y_off = 0;

@@ -148,11 +148,7 @@ static void psyq_gpu_walk(const u32 *p, const char *who) {
 
     psyq_gpu_window(&lo, &hi);
     if (port_gpu_log_on) {
-        long long t0;
-        struct timespec ts;
-
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        t0 = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        unsigned long long t0 = port_gpu_cycles();
         for (;;) {
             u32 tag = *p;
             u32 len = tag >> 24;
@@ -180,8 +176,7 @@ static void psyq_gpu_walk(const u32 *p, const char *who) {
             }
             p = q;
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        port_gpu_log_walk((long long)ts.tv_sec * 1000000000LL + ts.tv_nsec - t0);
+        port_gpu_log_walk(port_gpu_cycles() - t0);
     } else
     for (;;) {
         u32 tag = *p;

@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "platform.h"
 #include "port_harness.h"
@@ -39,6 +41,29 @@ void port_fatal(const char *fmt, ...) {
     port_crash_log_line(line);
     port_crash_report("fatal", 1, line);
     port_exit(1, "fatal error");
+}
+
+/* <PREFIX>_CPU_AFFINITY=<mask>: pins the process (one thread: the whole port) to the CPUs in the mask, e.g. 0x4 for
+ * cpu2. On a handheld every IRQ is delivered to cpu0 (the Wi-Fi, the display, the GPU's power management), so a game
+ * left to the scheduler ends up sharing that core; with four cores, three can do without the interrupt traffic. */
+static void port_cpu_pin(void) {
+#if defined(__linux__) && defined(SYS_sched_setaffinity)
+    const char *env = getenv(PSXSTACK_GAME_ENV_PREFIX "_CPU_AFFINITY");
+    unsigned long mask;
+
+    if (env == NULL || env[0] == '\0') {
+        return;
+    }
+    mask = strtoul(env, NULL, 0);
+    if (mask == 0) {
+        return;
+    }
+    if (syscall(SYS_sched_setaffinity, 0, sizeof mask, &mask) != 0) {
+        port_log("cpu: cannot pin to mask 0x%lx", mask);
+        return;
+    }
+    port_log("cpu: pinned to mask 0x%lx", mask);
+#endif
 }
 
 static void usage(const char *argv0) {
@@ -403,6 +428,7 @@ int main(int argc, char **argv) {
     port_file_line_buffered(stderr); /* a line at a time to the launcher's pipe (unbuffered on Windows) */
     port_crash_init(crash_dir);
     port_log("version %s (%s)", port_version, port_commit);
+    port_cpu_pin();
     if (port_trace) {
         psyq_set_trace(1, stderr); /* else the shim decides by <PREFIX>_PORT_TRACE at its first call */
     }

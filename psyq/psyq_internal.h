@@ -93,7 +93,8 @@ void gpu_draw_state(u32 *e1, u32 *e3, u32 *e4, u32 *e5);
 extern int port_gpu_log_on;
 void port_gpu_log_init(void);
 void port_gpu_log_span(int kind, int pixels); /* 0 fill, 1 flat, 2 ftex, 3 fblend, 4 gour, 5 gtex, 6 gblend */
-void port_gpu_log_walk(long long ns);
+unsigned long long port_gpu_cycles(void); /* the log's clock: the ARM virtual counter, monotonic ns elsewhere */
+void port_gpu_log_walk(unsigned long long cycles);
 void port_gpu_log_frame(void);
 
 /* gpu.c's decoded commands for the hardware renderer (runtime/render_gpu.c; issue #31): an optional listener, called
