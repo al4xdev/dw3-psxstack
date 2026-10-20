@@ -1306,9 +1306,68 @@ static unsigned gpu_log_mask_px;        /* their pixels */
 static unsigned gpu_log_load_px;        /* pixels of the CPU-to-VRAM transfers (LoadImage) */
 static unsigned gpu_log_spans;          /* spans (triangle rows) drawn */
 
+/* What a GPU backend would have to draw for this frame, counted per submitted primitive. The batch key is what the
+ * reference implementation compares to decide a flush (texture page and depth, CLUT, transparency mode, dithering,
+ * texture window, the mask flags): a change of key is one more draw call, and a draw call costs 11.2 us on the
+ * handheld (docs/gpu/07-cost-model.md). Measured at the primitive's entry, so it says nothing about pixel cost. */
+static unsigned gpu_log_prims;   /* polygons (a quad counts once), rectangles and line segments */
+static unsigned gpu_log_batches; /* entries whose state differed from the previous one */
+static unsigned gpu_log_semi;    /* primitives with semi-transparency enabled */
+static unsigned gpu_log_bgfg;    /* of those, mode 2 (background - foreground): the one that cannot batch */
+static unsigned gpu_log_cmask;   /* primitives that check the mask bit */
+static unsigned gpu_log_smask;   /* primitives that set it */
+static unsigned gpu_log_loads;   /* CPU-to-VRAM transfers (LoadImage calls) */
+static unsigned gpu_log_copies;  /* VRAM-to-VRAM transfers */
+static unsigned long long gpu_log_last_key;
+static int gpu_log_have_key;
+
 /* A cycle is a nanosecond off an ARM host (the clock is the monotonic one there). On the handheld the ARM virtual
  * counter is readable from EL0 and its frequency is calibrated against the monotonic clock once. */
 static double gpu_log_ns_per_cycle = 1.0;
+
+/* Counts one submitted primitive and whether its state would start a new batch. Off unless DW3_GPU_LOG is on: the
+ * key is a handful of multiplies, which is nothing per primitive and would still be out of place in a span loop. */
+static void gpu_log_draw(const Mode *m) {
+    unsigned long long key;
+
+    if (!port_gpu_log_on) {
+        return;
+    }
+    gpu_log_prims++;
+    if (m->semi) {
+        gpu_log_semi++;
+        if (m->abr == 2) {
+            gpu_log_bgfg++;
+        }
+    }
+    if (g.check_mask) {
+        gpu_log_cmask++;
+    }
+    if (g.set_mask != 0) {
+        gpu_log_smask++;
+    }
+    /* FNV over the fields a hardware backend batches on, so a collision would have to be built on purpose. The
+     * texture page and the CLUT are deliberately NOT here: they travel per vertex (nointerpolation attributes, as in the
+     * reference's BatchVertex, gpu_hw.h:121-137), so polygons from different pages share a batch when their depth,
+     * transparency mode, dithering, texture window and mask flags agree. Including them counted 3x too many batches. */
+    key = 1469598103934665603ull;
+#define GPU_LOG_MIX(v) (key = (key ^ (unsigned long long)(v)) * 1099511628211ull)
+    GPU_LOG_MIX(m->textured);
+    GPU_LOG_MIX(m->semi ? m->abr + 1 : 0);
+    GPU_LOG_MIX(m->dither);
+    GPU_LOG_MIX(m->u_and);
+    GPU_LOG_MIX(m->u_or);
+    GPU_LOG_MIX(m->v_and);
+    GPU_LOG_MIX(m->v_or);
+    GPU_LOG_MIX(g.check_mask);
+    GPU_LOG_MIX(g.set_mask);
+#undef GPU_LOG_MIX
+    if (!gpu_log_have_key || key != gpu_log_last_key) {
+        gpu_log_batches++;
+        gpu_log_last_key = key;
+        gpu_log_have_key = 1;
+    }
+}
 
 unsigned long long port_gpu_cycles(void) {
 #if defined(__arm__)
@@ -1639,6 +1698,7 @@ static void gpu_polygon(const u32 *w) {
     m.dither = g.dither && gouraud;
     m.eight = m.dither;
     m.gouraud = gouraud;
+    gpu_log_draw(&m);
     /* A quad is the triangles (1, 2, 3) and (0, 1, 2), in that order: where they overlap the second one shows (the
      * emulator's; golden family gpu, uv_ramp_* quads). */
     if (quad) {
@@ -1688,6 +1748,7 @@ static void gpu_rectangle(const u32 *w) {
     if (gpu_skip_above() > 0 && (long)width * height > gpu_skip_big) {
         return;
     }
+    gpu_log_draw(&m);
     if (gpu_listener != NULL) {
         GpuEvent ev;
         gpu_event_mode(&ev, GPU_EV_RECT, &m);
@@ -2006,6 +2067,7 @@ static void gpu_execute_body(void) {
         gpu_line_mode(&m, code);
         gpu_line_vertex(&a, w[0], w[1]);
         gpu_line_vertex(&b, gour ? w[2] : w[0], gour ? w[3] : w[2]);
+        gpu_log_draw(&m);
         gpu_segment(&m, &a, &b, gour);
         if (code & 8) {
             /* A polyline: keep the last vertex (and its colour) and wait for more. */
@@ -2025,6 +2087,9 @@ static void gpu_execute_body(void) {
         return;
     case 4:
         gpu_copy(w);
+        if (port_gpu_log_on) {
+            gpu_log_copies++;
+        }
         return;
     case 5:
         g.load_x = w[1] & 0x3FF;
@@ -2033,6 +2098,9 @@ static void gpu_execute_body(void) {
         g.load_h = ((((w[2] >> 16) & 0xFFFF) - 1) & 0x1FF) + 1;
         g.load_i = 0;
         g.load_left = g.load_w * g.load_h;
+        if (port_gpu_log_on) {
+            gpu_log_loads++;
+        }
         return;
     case 6:
         return; /* VRAM to CPU: nobody reads */
@@ -2258,7 +2326,7 @@ void port_gpu_log_frame(void) {
     long long now;
     double n;
     int i;
-    char line[320];
+    char line[640];
     const char *name[7] = {"fill", "flat", "ftex", "fblend", "gour", "gtex", "gblend"};
 
     if (!port_gpu_log_on) {
@@ -2304,6 +2372,13 @@ void port_gpu_log_frame(void) {
     /* The audio's share of the frame, in the same unit. */
     snprintf(line + strlen(line), sizeof line - strlen(line), " | aud %.1f ms",
              (double)gpu_log_audio * gpu_log_ns_per_cycle / n / 1e6);
+    /* What a GPU backend would submit: the primitives, the batches their state splits them into (a draw call costs
+     * 11.2 us on this handheld), and how much is semi-transparent, mask-checked or uploaded from the CPU. */
+    snprintf(line + strlen(line), sizeof line - strlen(line),
+             " | prims %.0f batch %.0f semi %.0f bgfg %.0f cmask %.0f smask %.0f loads %.1f copies %.1f",
+             (double)gpu_log_prims / n, (double)gpu_log_batches / n, (double)gpu_log_semi / n,
+             (double)gpu_log_bgfg / n, (double)gpu_log_cmask / n, (double)gpu_log_smask / n,
+             (double)gpu_log_loads / n, (double)gpu_log_copies / n);
     if (gpu_log_file != NULL) {
         fprintf(gpu_log_file, "%s\n", line);
         fflush(gpu_log_file);
@@ -2327,6 +2402,15 @@ void port_gpu_log_frame(void) {
     gpu_log_alias_spans = 0;
     gpu_log_load_px = 0;
     gpu_log_spans = 0;
+    gpu_log_prims = 0;
+    gpu_log_batches = 0;
+    gpu_log_semi = 0;
+    gpu_log_bgfg = 0;
+    gpu_log_cmask = 0;
+    gpu_log_smask = 0;
+    gpu_log_loads = 0;
+    gpu_log_copies = 0;
+    gpu_log_have_key = 0;
     gpu_log_frames = 0;
     gpu_log_sec = now;
 }
