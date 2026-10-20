@@ -59,6 +59,7 @@ static char gles_what[96];
 
 /* What the listener was asked to draw but cannot yet: the M2/M3/M4 work, counted so a test can report it. */
 static unsigned gles_ev_count[8];
+static unsigned long gles_uploaded; /* pixels uploaded from the shim's VRAM since the start (logged by the check) */
 
 /* The batch the drawing accumulates in (M2: untextured rectangles). It flushes when the state a draw depends on
  * changes - the drawing area (a scissor) and the mask flags - or when the vertex buffer fills, which is the same rule
@@ -88,7 +89,11 @@ static int gles_batch_textured; /* the kind of primitives in the batch: the two 
 static int gles_batch_area[4] = {-1, -1, -1, -1};
 static int gles_batch_mask = -1;
 static int gles_drawn[4];          /* what the target has drawn since the read copy was last refreshed */
-static int gles_replace = 1; /* the listener draws instead of the software rasteriser (--renderer gles) */
+static int gles_replace = 1;  /* the listener draws instead of the software rasteriser (--renderer gles) */
+static int gles_off_flat;     /* DW3_GLES_NOFLAT=1: untextured primitives are counted, not drawn (bisecting) */
+static int gles_off_tex;      /* DW3_GLES_NOTEX=1: textured ones */
+static int gles_off_env = -1;
+static long gles_trace = -1;  /* DW3_GLES_TRACE=<frame>: log every rectangle of that frame (bisecting) */
 
 /* 5-5-5-1 to 8-8-8-8, the packing the target holds: r, g, b scaled from 5 bits, alpha the mask bit. Scaled by 255/31
  * with rounding, which is what makes the round trip exact (docs/gpu/02). */
@@ -123,6 +128,7 @@ static int gles_upload_rect(int x, int y, int w, int h) {
         return 0;
     }
     gles_expand(vram, stride, x, y, w, h, rgba);
+    gles_uploaded += (unsigned long)w * (unsigned long)h;
     glBindTexture(GL_TEXTURE_2D, gles_vram);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     free(rgba);
@@ -145,7 +151,13 @@ static const char *GLES_FLAT_VS =
 static const char *GLES_FLAT_FS =
     "precision highp float;\n"
     "varying vec4 v_col;\n"
-    "void main() { gl_FragColor = vec4(v_col.rgb / 255.0, v_col.a); }\n";
+    /* The PS1 quantises an untextured pixel to 5 bits: the shim's `c >> 3` (gpu.c gpu_pixel). Writing the 8-bit colour
+     * straight through left every pixel one step off (31 became 4 of 31 instead of 3), which is what the VRAM check
+     * reported before this line existed. */
+    "void main() {\n"
+    "  vec3 c5 = min(floor(v_col.rgb / 8.0), vec3(31.0));\n"
+    "  gl_FragColor = vec4(floor(c5 * 8.22580645 + 0.5) / 255.0, v_col.a);\n"
+    "}\n";
 
 /* The textured shader. Written for ES 3.00 on purpose: this device gives an ES 3.2 context whatever is asked for
  * (docs/gpu/06), and with integers the PS1's texture path becomes a transcription instead of a trick - the 4-bit and
@@ -485,6 +497,15 @@ static void gles_rect(const GpuEvent *ev) {
     if (ev->w <= 0 || ev->h <= 0) {
         return;
     }
+    if (gles_trace >= 0 && port_frames == gles_trace) {
+        /* DW3_GLES_TRACE=<frame>: every rectangle of that frame, with everything that decides its pixels. */
+        port_log("gles trace: %s rect %dx%d at %d,%d colour %d,%d,%d tex %d semi %d dither %d page %d,%d clut %d,%d"
+                 " uv %d,%d win %x/%x area %d,%d..%d,%d check %d set %d",
+                 ev->textured ? "tex" : "flat", ev->w, ev->h, ev->x, ev->y, ev->v[0].r, ev->v[0].g, ev->v[0].b,
+                 ev->textured, ev->semi, ev->dither, ev->tex_x, ev->tex_y, ev->clut_x, ev->clut_y, ev->v[0].u,
+                 ev->v[0].v, ev->u_and, ev->v_and, ev->area_x0, ev->area_y0, ev->area_x1, ev->area_y1, ev->check_mask,
+                 ev->set_mask != 0);
+    }
     if (ev->textured) {
         float u0 = (float)ev->v[0].u, v0 = (float)ev->v[0].v;
         float u1 = u0 + (float)ev->w, v1 = v0 + (float)ev->h;
@@ -552,6 +573,10 @@ static void gles_upload_wrapped(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) {
         return;
     }
+    /* A transfer lands in the target at once, so anything already queued must be drawn first: the shim'''s order is
+     * "the drawing, then the transfer", and a batch flushed after the upload would paint over it. That inversion is
+     * what made the title screen come out as its background colour with the movie frame gone. */
+    gles_flush();
     x &= 1023;
     y &= 511;
     x0[nx] = x;
@@ -605,14 +630,20 @@ static void gles_event(const GpuEvent *ev) {
         gles_draw_add(0, 0, VRAM_W, VRAM_H);
         break;
     case GPU_EV_RECT:
-        if (ev->semi || ev->dither) {
+        if (gles_off_flat && !ev->textured) {
+            gles_ev_count[ev->kind]++; /* DW3_GLES_NOFLAT: bisecting what paints a region */
+        } else if (gles_off_tex && ev->textured) {
+            gles_ev_count[ev->kind]++; /* DW3_GLES_NOTEX */
+        } else if (ev->semi || ev->dither) {
             gles_ev_count[ev->kind]++; /* semi-transparent or dithered: M4's fragment fetch and dither matrix */
         } else {
             gles_rect(ev);
         }
         break;
     case GPU_EV_TRIANGLE:
-        if (ev->semi || ev->dither || ev->gouraud) {
+        if ((gles_off_flat && !ev->textured) || (gles_off_tex && ev->textured)) {
+            gles_ev_count[ev->kind]++;
+        } else if (ev->semi || ev->dither || ev->gouraud) {
             gles_ev_count[ev->kind]++; /* Gouraud shading, semi-transparency or dithering: M4 */
         } else {
             gles_triangle(ev);
@@ -758,6 +789,17 @@ int render_gles_raster_start(int scale, char *why, size_t why_size) {
     glBindFramebuffer(GL_FRAMEBUFFER, gles_fbo);
     /* The target starts as the VRAM is now (the shim's power-on state or a loaded state). */
     gles_upload_rect(0, 0, VRAM_W, VRAM_H);
+    if (gles_off_env < 0) {
+        const char *e;
+
+        gles_off_env = 0;
+        e = getenv("DW3_GLES_NOFLAT");
+        gles_off_flat = e != NULL && e[0] == '1';
+        e = getenv("DW3_GLES_NOTEX");
+        gles_off_tex = e != NULL && e[0] == '1';
+        e = getenv("DW3_GLES_TRACE");
+        gles_trace = e != NULL ? atol(e) : -1;
+    }
     if (!gles_pipelines(why, why_size)) {
         render_gles_close();
         return 0;
@@ -889,6 +931,10 @@ int render_gles_read_vram(u16 *out) {
 }
 
 /* The events the listener could not draw yet, by GpuEventKind: M1 reports them instead of pretending. */
+unsigned long render_gles_uploaded(void) {
+    return gles_uploaded;
+}
+
 unsigned render_gles_undrawn(int kind) {
     return (kind >= 0 && kind < 8) ? gles_ev_count[kind] : 0;
 }

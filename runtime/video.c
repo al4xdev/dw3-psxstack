@@ -1058,10 +1058,11 @@ static void video_gles_vram_check(void) {
             }
             port_log("gles: vram check %ld (frame %ld): %.1f%% of the VRAM differs (%d pixels), first at %d,%d"
                      " sw 0x%04x hw 0x%04x, inside %d,%d..%d,%d; the undrawn counters say what is missing (triangles %u,"
-                     " rects %u, segments %u)",
+                     " rects %u, segments %u, uploaded %lu px)",
                      checks, port_frames, 100.0 * (double)diffs / (1024.0 * 512.0), diffs, fx, fy, fsw, fhw,
                      bx0, by0, bx1, by1,
-                     render_gles_undrawn(0), render_gles_undrawn(1), render_gles_undrawn(2));
+                     render_gles_undrawn(0), render_gles_undrawn(1), render_gles_undrawn(2),
+                     render_gles_uploaded());
         }
     }
 }
