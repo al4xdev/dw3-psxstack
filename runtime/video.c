@@ -968,7 +968,9 @@ static void video_present_stat(long long t0, int direct, int bits, int w, int h)
         return;
     }
     ms = n > 0 ? (double)acc / n / 1e6 : 0.0;
-    port_log("present: %.1f ms (%s %d-bit %dx%d)", ms, direct ? "direct" : "convert", bits, w, h);
+    if (port_log_verbose()) {
+        port_log("present: %.1f ms (%s %d-bit %dx%d)", ms, direct ? "direct" : "convert", bits, w, h);
+    }
     path = getenv("DW3_PRESENT_LOG");
     if (path != NULL && path[0] != '\0') {
         FILE *f = fopen(path, "a");

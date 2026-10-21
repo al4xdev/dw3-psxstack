@@ -17,16 +17,51 @@
 
 int port_trace;
 
+/* How much this run says. <PREFIX>_LOG=off silences the commentary (the crash report still gets the last lines, because
+ * that is what a bug report needs), soft - the default - is what a normal run prints, and heavy adds the periodic
+ * measurements (the per-second present line and the like), which are diagnostic and cost a line a second. The handheld
+ * menu's DEBUG group sets it, so a player who never asks for logs gets none. */
+int port_log_level = 1;
+
+/* Read once, on first use, from <PREFIX>_LOG (the handheld launcher sets it from settings.json's debug.logs). */
+static void port_log_read_env(void) {
+    static int done;
+    const char *e;
+
+    if (done) {
+        return;
+    }
+    done = 1;
+    e = getenv(PSXSTACK_GAME_ENV_PREFIX "_LOG");
+    if (e == NULL || e[0] == '\0' || strcmp(e, "soft") == 0) {
+        port_log_level = 1;
+    } else if (strcmp(e, "off") == 0) {
+        port_log_level = 0;
+    } else if (strcmp(e, "heavy") == 0) {
+        port_log_level = 2;
+    }
+}
+
 void port_log(const char *fmt, ...) {
     char line[512];
     va_list ap;
+    port_log_read_env();
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
+    if (port_log_level <= 0) {
+        port_crash_log_line(line); /* the crash report keeps the context it would have had */
+        return;
+    }
     fputs("port: ", stderr);
     fputs(line, stderr);
     fputc('\n', stderr);
     port_crash_log_line(line);
+}
+
+int port_log_verbose(void) {
+    port_log_read_env();
+    return port_log_level >= 2;
 }
 
 void port_fatal(const char *fmt, ...) {

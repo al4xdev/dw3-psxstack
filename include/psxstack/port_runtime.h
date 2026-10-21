@@ -20,6 +20,11 @@ extern const char port_commit[];  /* the commit's hash, "unknown" without git */
 /* ---- Logging (stderr; the last 64 lines also go to the crash report, crash.c) */
 extern int port_trace; /* --trace: every overlay resolve, every tick */
 void port_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* How much a run says, from <PREFIX>_LOG: "off" (the crash report still keeps the last lines), "soft" (the default) and
+ * "heavy" (soft plus the periodic measurements - a line a second per measurement, diagnostic only). port_log_verbose()
+ * is what a periodic line should ask before printing. */
+extern int port_log_level;
+int port_log_verbose(void);
 void port_fatal(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
 /* A function the game needs that the skeleton does not implement (psyq/psyq.h): prints `fn`, exits with 3. */
 void port_unimplemented(const char *fn) __attribute__((noreturn));
