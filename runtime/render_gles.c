@@ -1181,9 +1181,11 @@ void render_gles_frame(void) {
  * one's into a pixel buffer object, which costs the CPU nothing; a vsync later the wait lands on work that finished
  * long ago. One frame of display latency (20 ms at PAL) buys back ~10 ms of every frame. The first call has nothing
  * pending, so it takes the blocking path once and issues the first buffered read on its way out. 0 on failure. */
-static GLuint gles_pbo[2];
+#define GLES_PBO 3 /* the readback buffers: the map lands as many vsyncs behind as it takes to never wait */
+static GLuint gles_pbo[GLES_PBO];
 static int gles_pbo_bytes;
-static int gles_pbo_pending = -1; /* the buffer holding the read issued last vsync, or -1 */
+static int gles_pbo_head = -1; /* the slot the last read was issued into, or -1 */
+static int gles_pbo_filled;    /* slots holding an issued read: GLES_PBO once the ring is full */
 /* A mapped pixel buffer is uncached memory: converting 320x240 straight out of it cost 7.1 ms, a memcpy of the same
  * bytes into ordinary memory and the conversion from there a fraction of that. */
 static u8 *gles_display_scratch;
@@ -1256,40 +1258,47 @@ int render_gles_read_display_now(u16 *out, int x, int y, int w, int h) {
 }
 
 int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
-    /* DW3_GLES_LOG=1: what the display readback costs, split in its two halves (the driver's glReadPixels - which is
-     * the wait - and the 8-to-5-bit conversion), once a second. */
+    /* DW3_GLES_LOG=1: what the display readback costs, split in its two halves (the mapping, which is where the wait
+     * lands, and the 8-to-5-bit conversion), once a second. */
     static long long log_sec;
     static unsigned long long log_read, log_conv;
     static unsigned log_n;
     long long t_read = 0;
     size_t bytes;
+    int slot;
 
     if (!gles_rasterising || out == NULL || w <= 0 || h <= 0) {
         return 0;
     }
     bytes = (size_t)w * (size_t)h * 4;
     if (gles_pbo[0] == 0 || gles_pbo_bytes != (int)bytes) {
+        int i;
+
         if (gles_pbo[0] == 0) {
-            glGenBuffers(2, gles_pbo);
+            glGenBuffers(GLES_PBO, gles_pbo);
         }
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, gles_pbo[0]);
-        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, gles_pbo[1]);
-        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
+        for (i = 0; i < GLES_PBO; i++) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, gles_pbo[i]);
+            glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
+        }
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         gles_pbo_bytes = (int)bytes;
-        gles_pbo_pending = -1;
+        gles_pbo_head = -1;
+        gles_pbo_filled = 0;
         free(gles_display_scratch);
         gles_display_scratch = malloc(bytes);
         if (gles_display_scratch == NULL) {
             return 0;
         }
+        if (gles_logging()) {
+            port_log("gles: display readback buffers for %dx%d (%d bytes)", w, h, (int)bytes);
+        }
     }
     if (gles_logging()) {
         t_read = (long long)port_gpu_cycles();
     }
-    if (gles_pbo_pending < 0) {
-        /* The first frame: read it now, so the picture is never a frame late at startup, then start the rotation. */
+    if (gles_pbo_filled < GLES_PBO) {
+        /* Priming: the picture is read now (so it is never late at startup) and a buffered read is issued as well. */
         gles_read_pixels_wrapped(x, y, w, h, gles_display_scratch, 0);
         if (t_read != 0) {
             long long t1 = (long long)port_gpu_cycles();
@@ -1298,13 +1307,11 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
             t_read = t1;
         }
         gles_display_convert(gles_display_scratch, out, w, h);
-        gles_read_pixels_wrapped(x, y, w, h, NULL, gles_pbo[0]);
-        gles_pbo_pending = 0;
     } else {
-        int next = 1 - gles_pbo_pending;
+        /* The oldest read, issued GLES_PBO-1 vsyncs ago: by now the GPU has finished it however busy it was. */
         const u8 *map;
 
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, gles_pbo[gles_pbo_pending]);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, gles_pbo[(gles_pbo_head + 1) % GLES_PBO]);
         map = (const u8 *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
         if (t_read != 0) {
             long long t1 = (long long)port_gpu_cycles();
@@ -1317,10 +1324,14 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
             glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             gles_display_convert(gles_display_scratch, out, w, h);
         }
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        /* This vsync's read, into the buffer that the mapping just freed. */
-        gles_read_pixels_wrapped(x, y, w, h, NULL, gles_pbo[next]);
-        gles_pbo_pending = next;
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    /* This vsync's read into the ring's oldest slot, which the mapping just freed (the next one while priming). */
+    slot = (gles_pbo_head + 1) % GLES_PBO;
+    gles_read_pixels_wrapped(x, y, w, h, NULL, gles_pbo[slot]);
+    gles_pbo_head = slot;
+    if (gles_pbo_filled < GLES_PBO) {
+        gles_pbo_filled++;
     }
     if (t_read != 0) {
         long long now = (long long)port_gpu_cycles();
@@ -1330,7 +1341,7 @@ int render_gles_read_display(u16 *out, int x, int y, int w, int h) {
         if (log_sec == 0) {
             log_sec = now;
         } else if ((double)(now - log_sec) * gles_ns_per_cycle >= 1e9) {
-            port_log("gles: present readback %.2f ms (glReadPixels %.2f, 5-bit conversion %.2f), %u presents",
+            port_log("gles: present readback %.2f ms (the wait %.2f, 5-bit conversion %.2f), %u presents",
                      (double)(log_read + log_conv) * gles_ns_per_cycle / log_n / 1e6,
                      (double)log_read * gles_ns_per_cycle / log_n / 1e6,
                      (double)log_conv * gles_ns_per_cycle / log_n / 1e6, log_n);
@@ -1408,7 +1419,8 @@ void render_gles_close(void) {
         glDeleteBuffers(2, gles_pbo);
         gles_pbo[0] = gles_pbo[1] = 0;
         gles_pbo_bytes = 0;
-        gles_pbo_pending = -1;
+        gles_pbo_head = -1;
+        gles_pbo_filled = 0;
     }
     free(gles_display_scratch);
     gles_display_scratch = NULL;
