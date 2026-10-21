@@ -33,9 +33,9 @@ unsigned long long port_gpu_cycles(void);
 static struct {
     int on;
     double ns_per_cycle;
-    unsigned long long t_voices, t_verb, t_interp, t_all, samples;
+    unsigned long long t_voices, t_verb, t_interp, t_all, samples, frames;
     long long sec;
-} spu_prof = { -1, 0.0, 0, 0, 0, 0, 0, 0 };
+} spu_prof = { -1, 0.0, 0, 0, 0, 0, 0, 0, 0 };
 
 extern int port_gpu_log_on; /* DW3_GPU_LOG, psyq/gpu.c: the frame meter the SPU's numbers belong in */
 
@@ -55,8 +55,10 @@ static void spu_prof_init(void) {
     }
 }
 
-static double spu_prof_ms(unsigned long long cycles, unsigned long long samples) {
-    return samples > 0 ? (double)cycles * spu_prof.ns_per_cycle * 882.0 / (double)samples / 1e6 : 0.0;
+/* Milliseconds per vsync (the unit a frame budget is in). The samples per vsync depend on the rate - 882 at 50 Hz, 735
+ * at the game's 60 Hz mode - so the count is the window's, not a constant. */
+static double spu_prof_ms(unsigned long long cycles, unsigned long long frames) {
+    return frames > 0 ? (double)cycles * spu_prof.ns_per_cycle / (double)frames / 1e6 : 0.0;
 }
 
 
@@ -598,17 +600,21 @@ void spu_render(int16_t *out, int frames) {
         long long now = (long long)port_clock_ns();
 
         spu_prof.samples += (unsigned long long)frames;
+        spu_prof.frames++;
         if (spu_prof.sec == 0) {
             spu_prof.sec = now;
         } else if (now - spu_prof.sec >= 1000000000LL) {
-            port_log("spu: per 882 samples: total %.2f ms = voices %.2f (interpolation %.2f) + reverb %.2f + rest %.2f",
-                     spu_prof_ms(spu_prof.t_all, spu_prof.samples),
-                     spu_prof_ms(spu_prof.t_voices, spu_prof.samples),
-                     spu_prof_ms(spu_prof.t_interp, spu_prof.samples),
-                     spu_prof_ms(spu_prof.t_verb, spu_prof.samples),
-                     spu_prof_ms(spu_prof.t_all - spu_prof.t_voices - spu_prof.t_verb, spu_prof.samples));
+            port_log("spu: per vsync (%llu samples): total %.2f ms = voices %.2f (interpolation %.2f) + reverb %.2f + "
+                     "rest %.2f",
+                     spu_prof.samples / (spu_prof.frames > 0 ? spu_prof.frames : 1),
+                     spu_prof_ms(spu_prof.t_all, spu_prof.frames),
+                     spu_prof_ms(spu_prof.t_voices, spu_prof.frames),
+                     spu_prof_ms(spu_prof.t_interp, spu_prof.frames),
+                     spu_prof_ms(spu_prof.t_verb, spu_prof.frames),
+                     spu_prof_ms(spu_prof.t_all - spu_prof.t_voices - spu_prof.t_verb, spu_prof.frames));
             spu_prof.t_voices = spu_prof.t_verb = spu_prof.t_interp = spu_prof.t_all = 0;
             spu_prof.samples = 0;
+            spu_prof.frames = 0;
             spu_prof.sec = now;
         }
     }
