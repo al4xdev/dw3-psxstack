@@ -142,7 +142,7 @@ static void settings_memcard(const PortJson *root, const char *key, int slot) {
 
 void port_settings_load(const char *path) {
     static const char *const top_keys[] = { "schema", "disc", "video", "audio", "memcard1", "memcard2", "watchdog",
-                                            "input", "mods", "mod_order", "launcher", NULL };
+                                            "input", "mods", "mod_order", "launcher", "debug", NULL };
     static const char *const disc_keys[] = { "path", "sha1", NULL };
     static const char *const video_keys[] = { "window", "scale", "fullscreen", "refresh", "renderer", "internal_scale",
                                               "subpixel",
@@ -256,6 +256,14 @@ void port_settings_load(const char *path) {
     settings_memcard(root, "memcard1", 0);
     settings_memcard(root, "memcard2", 1);
     settings_int(root, "", "watchdog", 0, 3600, &s->watchdog);
+    /* "debug" belongs to the launcher: the handheld menu writes { "logs": "off" | "soft" | "heavy" } there and dw3.sh
+     * turns it into <PREFIX>_LOG, which the runtime reads from the environment. Named here so a run does not report it as
+     * an unknown key; nothing in the runtime reads it from the file. */
+    if ((obj = settings_member(root, "", "debug", PORT_JSON_OBJECT)) != NULL) {
+        static const char *const debug_keys[] = { "logs", NULL };
+
+        settings_unknown(obj, "debug", debug_keys);
+    }
     s->input = settings_member(root, "", "input", PORT_JSON_OBJECT);
     s->mods = settings_member(root, "", "mods", PORT_JSON_OBJECT);
     s->mod_order = settings_member(root, "", "mod_order", PORT_JSON_ARRAY);
