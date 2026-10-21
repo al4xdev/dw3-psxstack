@@ -410,6 +410,35 @@ void port_file_line_buffered(FILE *f) {
     setvbuf(f, NULL, _IOLBF, 0);
 }
 
+/* SDL installs its own SIGINT/SIGTERM handlers at init and turns the signals into an SDL_QUIT event - which this port
+ * never reads, because the game owns its loop and the window's events are only polled for the pad. So `timeout`, a
+ * supervisor, or a player's kill -TERM was swallowed: two runs of this port outlived their sessions on the handheld and
+ * kept drawing. Ours is installed after SDL's (port_pump_init runs after the video), exits through the pump's own path at
+ * the end of the next vsync - so the WAV header, the log and the record are finished - and leaves _exit to a second
+ * signal. */
+volatile sig_atomic_t port_quit_requested;
+static volatile sig_atomic_t port_quit_signals;
+
+static void port_quit_handler(int sig) {
+    (void)sig;
+    if (port_quit_signals++ > 0) {
+        _exit(1); /* a second one: the tidy exit is not coming, and a supervisor does not wait forever */
+    }
+    port_quit_requested = 1;
+}
+
+void port_install_quit_handlers(void) {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = port_quit_handler;
+    sa.sa_flags = 0; /* no SA_RESTART: a blocked read in a thread the exit does not need may return */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+}
+
 long long port_clock_ns(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);

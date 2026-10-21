@@ -5,6 +5,7 @@
 #ifndef PORT_PLATFORM_H
 #define PORT_PLATFORM_H
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -43,6 +44,10 @@ void port_file_close(int fd);
 void port_file_line_buffered(FILE *f);
 
 /* ---- Time: a monotonic clock in nanoseconds, and sleeps on it. */
+/* SIGTERM/SIGINT/SIGHUP end the run at the end of the next vsync (SDL's own handlers turn them into an SDL_QUIT event
+ * that this port never reads, so they were swallowed); a second signal exits immediately. */
+void port_install_quit_handlers(void);
+extern volatile sig_atomic_t port_quit_requested;
 long long port_clock_ns(void);
 void port_sleep_until_ns(long long when);  /* an absolute time of port_clock_ns; a signal never cuts it short */
 void port_sleep_ms(int ms);

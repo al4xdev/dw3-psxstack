@@ -48,6 +48,7 @@ static void port_pace(void);
 static void port_pause(void);
 
 void port_pump_init(void) {
+    port_install_quit_handlers(); /* after SDL's, whose handlers swallow the signals (platform.c) */
     port_phase_init();
     port_gpu_log_init();
     psyq_set_vsync_pre_hook(port_audio_frame); /* the SPU's samples of the frame, before the game's handler */
@@ -76,6 +77,9 @@ void port_pump_reset(void) {
  * log, the input script, the frame cap. */
 static void port_frame(void) {
     int cd;
+    if (port_quit_requested) {
+        port_exit(0, "signal (SIGTERM/SIGINT)"); /* the handler only sets the flag: this is where it is acted on */
+    }
     if (port_watchdog_armed) {
         port_watchdog_kick(); /* re-arm: progress */
     }
