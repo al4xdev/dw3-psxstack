@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "port_runtime.h" /* port_frames, for the load log */
 #include "psyq_internal.h"
 #include "psxstack/psyq/libgpu.h"
 
@@ -481,7 +482,7 @@ static void load_log(int x, int y, int w, int h) {
         load_log_on = env != NULL && env[0] != '\0' && env[0] != '0';
     }
     if (load_log_on) {
-        fprintf(stderr, "port: load: vram %d,%d %dx%d\n", x, y, w, h);
+        fprintf(stderr, "port: load: frame %ld vram %d,%d %dx%d\n", port_frames, x, y, w, h);
     }
 }
 
