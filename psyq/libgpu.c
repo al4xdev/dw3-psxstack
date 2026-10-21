@@ -9,6 +9,7 @@
  * port_tag_base + 4 * tag and follows it only inside the window. A harness's window (psyq_set_arena) holds PS1 lists
  * as they are: a tag is then a byte offset from the window's base, as on the PS1 (its port_ptr_to_u32 agrees). */
 #include <stdint.h>
+#include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -468,8 +469,25 @@ int ClearImage2(RECT *rect, u8 r, u8 g, u8 b) {
 }
 
 /* CPU to VRAM: the rectangle's pixels, row by row, from `p` (two per word). */
+/* DW3_LOAD_LOG=1: one line per VRAM transfer (LoadImage), with the rectangle. Written to find out what a scene really
+ * writes - the movies decode in 16-pixel columns and the display area is taller than some of them, so "the picture has
+ * stale pixels" and "the game never wrote those rows" look identical on screen. Off: one env read, once. */
+static int load_log_on = -1;
+
+static void load_log(int x, int y, int w, int h) {
+    if (load_log_on < 0) {
+        const char *env = getenv("DW3_LOAD_LOG");
+
+        load_log_on = env != NULL && env[0] != '\0' && env[0] != '0';
+    }
+    if (load_log_on) {
+        fprintf(stderr, "port: load: vram %d,%d %dx%d\n", x, y, w, h);
+    }
+}
+
 void LoadImage(RECT *rect, u32 *p) {
     PSYQ_TRACE("LoadImage %d,%d %dx%d from %u", rect->x, rect->y, rect->w, rect->h, PSYQ_PTR(p));
+    load_log(rect->x, rect->y, rect->w, rect->h);
     gpu_load_image(rect->x, rect->y, rect->w, rect->h, (const u16 *)p);
 }
 
