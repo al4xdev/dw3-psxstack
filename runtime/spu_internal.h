@@ -36,7 +36,55 @@ typedef struct SpuEnvelope {
     int32_t level;
     uint32_t counter;
 } SpuEnvelope;
-void spu_envelope_tick(SpuEnvelope *e, unsigned rate, int exponential, int decrease, int negative);
+/* The envelope's tick, here and not in spu_dsp.c: the mix calls it three times per voice per sample (63 times a
+ * frame), and across translation units it was a call every time - 3.2 ms of the SPU's 4.9. */
+/* psx-spx "Envelope Operation depending on Shift/Step/Mode/Direction", one 44,100 Hz tick. The step and the counter
+ * increment come from the 7-bit rate (shift = rate >> 2, step value = rate & 3); exponential increase above 6000h is
+ * slowed (step / 4, or counter increment / 4, or both / 2 at shift 10); exponential decrease scales the step by the
+ * level (>> 15: floor, so it reaches 0); the counter increment is at least 1 unless the rate is 7Fh (never steps); a
+ * step happens when the counter's bit 15 sets, and takes 8000h off the counter (psx-spx leaves the counter after a step
+ * open; with increments that divide 8000h this is the documented "1 SHL (shift-11) cycles" per step, and it makes
+ * shifts 26..31 alike, as psx-spx reports rate 76h behaving like 6Ah). Saturation: increase to -8000h..7FFFh,
+ * decrease to >= 0, decrease with the negative phase to -8000h..0. */
+static inline void spu_envelope_tick(SpuEnvelope *e, unsigned rate, int exponential, int decrease, int negative) {
+    int shift = (int)((rate >> 2) & 0x1F);
+    int32_t step = 7 - (int32_t)(rate & 3);
+    uint32_t inc;
+
+    if (decrease != negative) {
+        step = ~step; /* +7..+4 -> -8..-5 */
+    }
+    step = shift < 11 ? step * (1 << (11 - shift)) : step;
+    inc = shift > 11 ? 0x8000u >> (shift - 11) : 0x8000u;
+    if (exponential && !decrease && e->level > 0x6000) {
+        if (shift < 10) {
+            step >>= 2;
+        } else if (shift >= 11) {
+            inc >>= 2;
+        } else {
+            step >>= 1;
+            inc >>= 1;
+        }
+    } else if (exponential && decrease) {
+        step = (step * e->level) >> 15;
+    }
+    if ((rate & 0x7F) != 0x7F && inc == 0) {
+        inc = 1;
+    }
+    e->counter += inc;
+    if (!(e->counter & 0x8000)) {
+        return;
+    }
+    e->counter -= 0x8000;
+    e->level += step;
+    if (!decrease) {
+        e->level = spu_clamp16(e->level);
+    } else if (negative) {
+        e->level = e->level < -0x8000 ? -0x8000 : e->level > 0 ? 0 : e->level;
+    } else if (e->level < 0) {
+        e->level = 0;
+    }
+}
 
 /* The ADSR phases (spu_voice_info's phase). */
 enum { SPU_ATTACK, SPU_DECAY, SPU_SUSTAIN, SPU_RELEASE };

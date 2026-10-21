@@ -9,10 +9,56 @@
  * (LIBSND's per-tick flush writes them in that order) restarts it; a key-on uses the start address, pitch and ADSR
  * written before it. Every integer path is fixed-width and deterministic. docs/SOUND.md section 6 lists what psx-spx
  * leaves open and the reading taken here. */
+#include <stdlib.h>
 #include <string.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
+#include "platform.h"
+#include "port_harness.h"
+#include "port_runtime.h"
 #include "savestate.h"
 #include "spu_internal.h"
+
+/* The cycle counter (psyq/gpu.c) for the profiler below: a register read, ~10 cycles, cheap enough to wrap a voice. */
+unsigned long long port_gpu_cycles(void);
+
+/* DW3_GPU_LOG=1: where the mix's milliseconds go, per 882 samples (one frame at 50 Hz), once a second. The SPU is the
+ * second largest item of a battle frame after the game's own code, and "aud 3.9 ms" says nothing about which part of it
+ * to attack: the voice loop (24 voices, each interpolating and stepping an envelope), the reverb's two FIRs, or the
+ * capture writes. */
+
+static struct {
+    int on;
+    double ns_per_cycle;
+    unsigned long long t_voices, t_verb, t_interp, t_all, samples;
+    long long sec;
+} spu_prof = { -1, 0.0, 0, 0, 0, 0, 0, 0 };
+
+extern int port_gpu_log_on; /* DW3_GPU_LOG, psyq/gpu.c: the frame meter the SPU's numbers belong in */
+
+static void spu_prof_init(void) {
+    spu_prof.on = port_gpu_log_on != 0;
+    if (spu_prof.on) {
+        long long ns0 = (long long)port_clock_ns();
+        unsigned long long c0 = port_gpu_cycles(), c1;
+        long long ns1 = ns0;
+
+        while (ns1 - ns0 < 2000000LL) {
+            ns1 = (long long)port_clock_ns();
+        }
+        c1 = port_gpu_cycles();
+        spu_prof.ns_per_cycle = c1 > c0 ? (double)(ns1 - ns0) / (double)(c1 - c0) : 1.0;
+        spu_prof.sec = ns1;
+    }
+}
+
+static double spu_prof_ms(unsigned long long cycles, unsigned long long samples) {
+    return samples > 0 ? (double)cycles * spu_prof.ns_per_cycle * 882.0 / (double)samples / 1e6 : 0.0;
+}
+
 
 /* Register offsets from 0x1F801C00 (psx-spx names in comments). */
 enum {
@@ -184,7 +230,7 @@ static void spu_voice_block_end(int v) {
  * (exponential decrease, step -8) until the sustain level (N+1)*800h, sustain (its mode, direction, shift, step) until
  * key off, release (decrease, its mode and shift, step -8) to 0. A phase's end is checked after its step; the next
  * phase starts on the next tick with its counter at 0. */
-static void spu_adsr_tick(SpuVoice *vo, uint16_t adsr1, uint16_t adsr2) {
+static inline void spu_adsr_tick(SpuVoice *vo, uint16_t adsr1, uint16_t adsr2) {
     switch (vo->phase) {
     case SPU_ATTACK:
         spu_envelope_tick(&vo->env, (adsr1 >> 8) & 0x7F, adsr1 >> 15, 0, 0);
@@ -219,7 +265,7 @@ static void spu_volume_write(SpuEnvelope *vol, uint16_t value) {
     }
 }
 
-static void spu_volume_tick(SpuEnvelope *vol, uint16_t value) {
+static inline void spu_volume_tick(SpuEnvelope *vol, uint16_t value) {
     if (value & 0x8000) {
         spu_envelope_tick(vol, value & 0x7F, (value >> 14) & 1, (value >> 13) & 1, (value >> 12) & 1);
     }
@@ -256,7 +302,14 @@ static int32_t spu_voice_sample(int v, uint32_t pmon, uint32_t non, int32_t *l, 
         if (non & bit) {
             s = (int16_t)spu.noise_level;
         } else {
-            s = spu_gauss_interp(vo->buf + (vo->counter >> 12), (vo->counter >> 4) & 0xFF);
+            if (spu_prof.on) {
+                unsigned long long i0 = port_gpu_cycles();
+
+                s = spu_gauss_interp(vo->buf + (vo->counter >> 12), (vo->counter >> 4) & 0xFF);
+                spu_prof.t_interp += port_gpu_cycles() - i0;
+            } else {
+                s = spu_gauss_interp(vo->buf + (vo->counter >> 12), (vo->counter >> 4) & 0xFF);
+            }
         }
         out = spu_clamp16((s * vo->env.level) >> 15);
     }
@@ -264,7 +317,12 @@ static int32_t spu_voice_sample(int v, uint32_t pmon, uint32_t non, int32_t *l, 
     *l = (out * vo->vol[0].level) >> 15;
     *r = (out * vo->vol[1].level) >> 15;
 
-    spu_adsr_tick(vo, reg[4], reg[5]);
+    /* A voice released with its envelope at 0 stays at 0: the tick would step an internal counter that no register
+     * exposes and that every transition resets (spu_voice_start, spu_key_off, the block end's End+Mute), and the level
+     * it would add is negative and clamped back to 0. Most of the SPU's voices are in that state most of the time. */
+    if (vo->phase != SPU_RELEASE || vo->env.level != 0) {
+        spu_adsr_tick(vo, reg[4], reg[5]);
+    }
     spu_volume_tick(&vo->vol[0], reg[0]);
     spu_volume_tick(&vo->vol[1], reg[1]);
 
@@ -378,12 +436,41 @@ static void spu_reverb_tick(const int32_t in[2], int32_t out[2]) {
     }
 }
 
+/* The 39-tap filter's dot product. The scalar loop was 1 ms of the SPU's budget in a frame and it is a plain integer
+ * sum: NEON's vmlal_s16 accumulates 8 taps at a time into 32-bit lanes. The lanes are added in another order than the
+ * scalar loop's, which cannot change the value (integer addition is associative, and the build wraps on overflow with
+ * -fwrapv), so the picture and the WAV stay byte for byte what they were. */
+static inline int32_t spu_fir_dot(const int16_t *x) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    int32x4_t acc = vdupq_n_s32(0);
+    int32_t out;
+    int k = 0;
+
+    for (; k + 4 <= SPU_FIR_TAPS; k += 4) {
+        acc = vmlal_s16(acc, vld1_s16(spu_fir + k), vld1_s16(x + k)); /* 4 taps a step: the widest this widens */
+    }
+    out = vgetq_lane_s32(acc, 0) + vgetq_lane_s32(acc, 1) + vgetq_lane_s32(acc, 2) + vgetq_lane_s32(acc, 3);
+    for (; k < SPU_FIR_TAPS; k++) {
+        out += spu_fir[k] * x[k];
+    }
+    return out;
+#else
+    int32_t acc = 0;
+    int k;
+
+    for (k = 0; k < SPU_FIR_TAPS; k++) {
+        acc += spu_fir[k] * x[k];
+    }
+    return acc;
+#endif
+}
+
 /* The reverb's resampling (psx-spx "Reverb Buffer Resampling"): the input goes through the 39-tap filter and every other
  * sample feeds a reverb tick; the ticks' outputs, zero-stuffed back to 44,100 Hz, go through the same filter at twice
  * the gain (the zeros halve it). Together 19 + 19 = 38 samples of delay, as psx-spx measured. */
 static void spu_reverb_sample(const int32_t in[2], int32_t out[2]) {
     int tick = (spu.samples & 1) == 0;
-    int ch, k;
+    int ch;
 
     int pos = spu.fir_pos = (spu.fir_pos + 1) % SPU_FIR_TAPS;
 
@@ -394,11 +481,8 @@ static void spu_reverb_sample(const int32_t in[2], int32_t out[2]) {
         int32_t down[2], wet[2];
         for (ch = 0; ch < 2; ch++) {
             const int16_t *x = &spu.rev_in[ch][pos + 1];
-            int32_t acc = 0;
-            for (k = 0; k < SPU_FIR_TAPS; k++) {
-                acc += spu_fir[k] * x[k];
-            }
-            down[ch] = spu_clamp16(acc >> 15);
+
+            down[ch] = spu_clamp16(spu_fir_dot(x) >> 15);
         }
         spu_reverb_tick(down, wet);
         for (ch = 0; ch < 2; ch++) {
@@ -411,10 +495,7 @@ static void spu_reverb_sample(const int32_t in[2], int32_t out[2]) {
     }
     for (ch = 0; ch < 2; ch++) {
         const int16_t *x = &spu.rev_out[ch][pos + 1];
-        int32_t acc = 0;
-        for (k = 0; k < SPU_FIR_TAPS; k++) {
-            acc += spu_fir[k] * x[k];
-        }
+        int32_t acc = spu_fir_dot(x);
         out[ch] = spu_clamp16(acc >> 14);
     }
 }
@@ -434,6 +515,8 @@ static void spu_sample(int16_t *out) {
     uint32_t cap = spu.capture_pos * 2;
     int v, ch;
 
+    unsigned long long t0 = spu_prof.on ? port_gpu_cycles() : 0;
+
     spu_noise_tick();
     for (v = 0; v < SPU_VOICES; v++) {
         int32_t l, r, o = spu_voice_sample(v, pmon, non, &l, &r);
@@ -447,6 +530,12 @@ static void spu_sample(int16_t *out) {
         if (v == 1 || v == 3) {
             spu_ram_write16((v == 1 ? 0x800 : 0xC00) + cap, (uint16_t)(int16_t)o);
         }
+    }
+    if (t0 != 0) {
+        unsigned long long t1 = port_gpu_cycles();
+
+        spu_prof.t_voices += t1 - t0;
+        t0 = t1;
     }
     if (spu.cd_count > 0) {
         cd[0] = spu.cd[spu.cd_head][0];
@@ -467,6 +556,11 @@ static void spu_sample(int16_t *out) {
         }
     }
     spu_reverb_sample(wet_in, wet);
+    if (t0 != 0) {
+        unsigned long long t1 = port_gpu_cycles();
+
+        spu_prof.t_verb += t1 - t0;
+    }
     for (ch = 0; ch < 2; ch++) {
         int32_t s = 0;
         if ((attr & (ATTR_ENABLE | ATTR_UNMUTE)) == (ATTR_ENABLE | ATTR_UNMUTE)) {
@@ -486,8 +580,37 @@ static void spu_sample(int16_t *out) {
 void spu_render(int16_t *out, int frames) {
     int i;
 
+    if (spu_prof.on <= 0) {
+        spu_prof_init(); /* the pump's meter may start after the first mix: read the flag again until it is on */
+    }
+
     for (i = 0; i < frames; i++) {
-        spu_sample(out != NULL ? out + 2 * i : NULL);
+        if (spu_prof.on) {
+            unsigned long long a0 = port_gpu_cycles();
+
+            spu_sample(out != NULL ? out + 2 * i : NULL);
+            spu_prof.t_all += port_gpu_cycles() - a0;
+        } else {
+            spu_sample(out != NULL ? out + 2 * i : NULL);
+        }
+    }
+    if (spu_prof.on) {
+        long long now = (long long)port_clock_ns();
+
+        spu_prof.samples += (unsigned long long)frames;
+        if (spu_prof.sec == 0) {
+            spu_prof.sec = now;
+        } else if (now - spu_prof.sec >= 1000000000LL) {
+            port_log("spu: per 882 samples: total %.2f ms = voices %.2f (interpolation %.2f) + reverb %.2f + rest %.2f",
+                     spu_prof_ms(spu_prof.t_all, spu_prof.samples),
+                     spu_prof_ms(spu_prof.t_voices, spu_prof.samples),
+                     spu_prof_ms(spu_prof.t_interp, spu_prof.samples),
+                     spu_prof_ms(spu_prof.t_verb, spu_prof.samples),
+                     spu_prof_ms(spu_prof.t_all - spu_prof.t_voices - spu_prof.t_verb, spu_prof.samples));
+            spu_prof.t_voices = spu_prof.t_verb = spu_prof.t_interp = spu_prof.t_all = 0;
+            spu_prof.samples = 0;
+            spu_prof.sec = now;
+        }
     }
 }
 
