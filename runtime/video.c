@@ -101,10 +101,6 @@ static u32 video_rgb15(u16 c) {
     return 0xFF000000u | r << 16 | g << 8 | b;
 }
 
-/* -1: not read yet. DW3_GLES_PRESENT_NOW=1 presents with the blocking read of the display instead of the PBO ring, which
- * lands two vsyncs late (see the note at the branch that uses it). Declared here, outside the build-configuration
- * branches below, each of which defines its own video_present(). */
-static int video_present_now = -1;
 
 /* Byte `x` (0..2047, wrapping) of VRAM row `row`: the low byte of a pixel first. */
 static u32 video_byte(const u16 *row, int x) {
@@ -1006,16 +1002,7 @@ static int video_present_direct(long long *t0) {
          * it is three bytes per pixel of the VRAM words, which the RGBA8 target does not hold (it stores 5-5-5-1 per
          * word), so feeding it the converted 15-bit picture drew the movie with the wrong colours. Those come from the
          * array, which for a 24-bit display is exactly where the movie is (the MDEC writes it through the shim). */
-        /* DW3_GLES_PRESENT_NOW=1: read the display as it is this vsync instead of through the PBO ring, which lands two
-         * vsyncs late. The ring buys ~10 ms of every frame and is the one thing in this path that can put a *previous*
-         * picture on screen; the switch exists to say, in one run, whether the artefact in the movies comes from there. */
-        if (video_present_now < 0) {
-            const char *e = getenv("DW3_GLES_PRESENT_NOW");
-
-            video_present_now = e != NULL && e[0] == '1';
-        }
-        if ((video_present_now ? render_gles_read_display_now(video_gles_display, d.x, d.y, d.w, d.h)
-                               : render_gles_read_display(video_gles_display, d.x, d.y, d.w, d.h)) &&
+        if (render_gles_read_display(video_gles_display, d.x, d.y, d.w, d.h) &&
             Fbdev_PresentVram(&fbdev, video_gles_display, d.w, 0, 0, d.w, d.h, d.rgb24) == 0) {
             video_w = d.w;
             video_h = d.h;
