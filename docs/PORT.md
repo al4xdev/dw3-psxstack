@@ -343,7 +343,7 @@ and the shim lacks stops the run with `port_unimplemented(name)` (status 3) and 
 against the PS1 or an emulator) are listed in `psyq/README.md` "Behaviour assumed".
 
 ## Rendering
-- **Software GPU** (`psyq/gpu.c`): a 1024x512 VRAM of 16-bit pixels and every GP0 drawing command the primitive types produce: flat/Gouraud/textured polygons with 4/8/15-bit textures and CLUTs, texture windows,
+- **Software GPU** (`psyq/gpu.c`): a 1024x512 VRAM of 16-bit pixels (1024x1024 for a game that asks for more texture room: `port_video_vram_extend`, gpu.c "The extension") and every GP0 drawing command the primitive types produce: flat/Gouraud/textured polygons with 4/8/15-bit textures and CLUTs, texture windows,
   the four blend modes, dithering, mask bits, lines, rectangles, fills, VRAM copies and transfers, the draw area and
   offset. Exact VRAM semantics matter: games reuse VRAM (`MoveImage`, `DR_MOVE` cursors with `BreakDraw`/`ContinueDraw`). It is built at `-O3` in every build.
 - **Video output** (`runtime/video.c`): every vsync the display area set by `PutDispEnv` is read from the VRAM in 15-
@@ -411,8 +411,13 @@ against the PS1 or an emulator) are listed in `psyq/README.md` "Behaviour assume
     aspect (320 -> 428 wide); every unit drawn into a buffer is drawn there a second time, translated, with the drawing
     area widened where it reaches the buffer's edge and full-screen untextured 2D (clears, fades) stretched to the
     canvas's edges. The VRAM part is unchanged, so the canvas's middle is the 4:3 picture. The present shows the canvas
-    at 16:9 inside the window (a new window opens 16:9); `--gpu-screenshot` gives the wide image; the software
-    renderer, `--screenshot` and the frame hash stay 4:3.
+    at that aspect inside the window (a new window opens 16:9), placed by `video.scaling` (integer: at the canvas's
+    own aspect, pixel for pixel); `--gpu-screenshot` gives
+    the wide image; the software
+    renderer, `--screenshot` and the frame hash stay 4:3. A game whose 2D can draw past the screen's edges (a tiled
+    map) asks `port_video_widescreen_pad()` for the canvas's columns past each side (0 while the picture is 4:3) and
+    draws that far; the extra textures that takes may go in the extended VRAM (`port_video_vram_extend`: rows 512-1023
+    hold textures and CLUTs, in the renderer's VRAM copy, not in its target).
   - The software GPU stays the reference and the default; every existing test uses it.
 
 ## Texture replacement

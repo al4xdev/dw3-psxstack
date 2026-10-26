@@ -100,8 +100,9 @@ int span_start(int y) {
     return max(xl, nva.z);
 }
 
+// The VRAM copy has 1024 rows (an extended VRAM's: render_gpu.c); a page's rows never wrap past it.
 uint texel(int u, int v) {
-    int row = (tex.y + v) & 511;
+    int row = (tex.y + v) & 1023;
     if (kind.w == 1) {
         uint px = vram.Load(int3((tex.x + (u >> 2)) & 1023, row, 0));
         return vram.Load(int3((tex.z + int((px >> ((u & 3) * 4)) & 0xF)) & 1023, tex.w, 0));

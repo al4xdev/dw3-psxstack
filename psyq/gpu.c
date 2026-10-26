@@ -1,4 +1,5 @@
 /* psyq/gpu.c: the GPU in software: a 1024x512 VRAM of 16-bit pixels and the GP0 commands that draw into it.
+ * A game may extend it to 1024x1024 (gpu_vram_extend: Psy-Q's 2 MB VRAM layout, below).
  * Written from public hardware documentation (psx-spx "GPU"), then measured against the emulator: the layer-1 family
  * `gpu` (tests/golden/families/gpu.py) runs command lists on the PS1 in PCSX-Redux (its software GPU) and reads the
  * VRAM back, tests/host/gpu_replay.py replays them here. Where the two disagree the emulator's pixels win (the M2 test is
@@ -50,7 +51,7 @@
 #endif
 
 #define VRAM_W 1024
-#define VRAM_H 512
+#define VRAM_H 1024 /* the rows kept; the VRAM has gpu_rows of them */
 /* The rows are padded: a texture walk steps down v one row per pixel, and a 1024-pixel (2048-byte) row stride is a
  * multiple of 32 cache lines, so every row lands in the same L1 set and evicts the one before it. On the handheld
  * (Cortex-A35, 32 KB 4-way L1) that made the fetch four times slower than the padded one: 119 ns per pixel against 31
@@ -61,6 +62,16 @@
 #define VRAM_STRIDE (VRAM_W + VRAM_PAD)
 
 static u16 gpu_vram[VRAM_STRIDE * VRAM_H] __attribute__((aligned(64)));
+
+/* The extension (gpu_vram_extend; psyq_internal.h): the VRAM's rows, 512, or 1024 for a game that asked for more
+ * texture room. Rows 512-1023 are Psy-Q's 2 MB VRAM: getTPage puts y bit 9 into the texture page's bit 11 and getClut
+ * into the CLUT's bit 15, which a 1 MB GPU ignores; transfers, fills and copies wrap at the VRAM's height. Only textures
+ * and CLUTs live there: the drawing area stays in rows 0-511 (E3/E4 have 9 bits of y), and so does the display. A
+ * texture page's rows stay within the VRAM either way (its corner is at most 768 extended, 256 otherwise, and a
+ * windowed v at most 255), so the texel fetches mask with VRAM_H - 1 in both. */
+static int gpu_rows = 512;
+static u32 gpu_page_bits = 0x1FF; /* the texture page's bits kept: 0-8, and 11 once extended */
+#define VRAM_YMASK (gpu_rows - 1)
 
 /* Write stamps: every write to the VRAM stamps the 64-pixel blocks it touches with the current stamp (gpu_touch), which
  * advances whenever a texture segment is decoded (gpu_decoded): a decoded segment stays valid while none of the blocks
@@ -163,6 +174,15 @@ int gpu_vram_stride(void) {
     return VRAM_STRIDE;
 }
 
+void gpu_vram_extend(void) {
+    gpu_rows = 1024;
+    gpu_page_bits = 0x9FF;
+}
+
+int gpu_vram_rows(void) {
+    return gpu_rows;
+}
+
 void gpu_reset_state(void) {
     g.texpage = 0;
     g.dither = 0;
@@ -240,7 +260,7 @@ GPU_INLINE u16 gpu_fetch(const u16 *row, const u16 *clut, int tex_x, int clut_x,
 }
 
 static inline u16 gpu_texel(const Mode *m, int u, int v) {
-    const u16 *row = &gpu_vram[((m->tex_y + ((v & m->v_and) | m->v_or)) & 511) * VRAM_STRIDE];
+    const u16 *row = &gpu_vram[((m->tex_y + ((v & m->v_and) | m->v_or)) & (VRAM_H - 1)) * VRAM_STRIDE];
     const u16 *clut = &gpu_vram[m->clut_y * VRAM_STRIDE];
 
     u = (u & m->u_and) | m->u_or;
@@ -527,14 +547,15 @@ static void gpu_event_mode(GpuEvent *ev, GpuEventKind kind, const Mode *m) {
     ev->check_mask = g.check_mask;
 }
 
-/* The texture page attribute of a textured polygon (also E1's bits 0-8): sets the mode's page, depth and blend. */
+/* The texture page attribute of a textured polygon (also E1's bits 0-8, and 11 when extended): sets the mode's page,
+ * depth and blend. */
 static void gpu_apply_texpage(u32 page) {
-    g.texpage = (g.texpage & ~0x1FFu) | (page & 0x1FF);
+    g.texpage = (g.texpage & ~gpu_page_bits) | (page & gpu_page_bits);
 }
 
 static void gpu_mode_from_texpage(Mode *m) {
     m->tex_x = (g.texpage & 0xF) * 64;
-    m->tex_y = ((g.texpage >> 4) & 1) * 256;
+    m->tex_y = ((g.texpage >> 4) & 1) * 256 + ((g.texpage >> 11) & 1) * 512;
     m->abr = (g.texpage >> 5) & 3;
     if (m->textured) {
         int depth = (g.texpage >> 7) & 3;
@@ -625,8 +646,8 @@ static int gpu_span_row_clear(const Mode *m, int y, int n, const Interp *iv, int
     int v0 = ((av + iv->q) & m->v_and) | m->v_or;
     int v1 = ((av + iv->q + n * (iv->sq + (iv->srem > 0))) & m->v_and) | m->v_or;
     int lo = v0 < v1 ? v0 : v1, hi = v0 < v1 ? v1 : v0;
-    int r0 = (m->tex_y + lo) & 511, r1 = (m->tex_y + hi) & 511;
-    int dy = y & 511;
+    int r0 = (m->tex_y + lo) & (VRAM_H - 1), r1 = (m->tex_y + hi) & (VRAM_H - 1);
+    int dy = y & VRAM_YMASK;
 
     /* The texture rows touched are r0..r1, wrapping at 512: the span is safe unless dy is among them. */
     if (r0 <= r1) {
@@ -657,7 +678,7 @@ GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp
 
     /* The 4-bit CLUT is sixteen entries: copied out unless this span draws into its row, which would change what
      * the next pixel reads. A span on any other row cannot touch it. */
-    if (depth == 1 && clut_x + 16 <= VRAM_W && (y & 511) != m->clut_y) {
+    if (depth == 1 && clut_x + 16 <= VRAM_W && (y & VRAM_YMASK) != m->clut_y) {
         int k;
 
         for (k = 0; k < 16; k++) {
@@ -676,7 +697,7 @@ GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp
             int u = ((au + iu->q) & u_and) | u_or, v = ((av + iv->q) & v_and) | v_or;
 
             if (v != last_v) {
-                row = &gpu_vram[((tex_y + v) & 511) * VRAM_STRIDE];
+                row = &gpu_vram[((tex_y + v) & (VRAM_H - 1)) * VRAM_STRIDE];
                 last_v = v;
             }
             if (cached) {
@@ -741,7 +762,7 @@ GPU_INLINE void gpu_span_flat_neon(const Mode *m, u16 *dst, int y, int n, Interp
     }
     for (; i < n; i++) {
         int u = ((au + iu->q) & u_and) | u_or, v = ((av + iv->q) & v_and) | v_or;
-        u16 t = gpu_fetch(&gpu_vram[((tex_y + v) & 511) * VRAM_STRIDE], clut, tex_x, clut_x, u, depth);
+        u16 t = gpu_fetch(&gpu_vram[((tex_y + v) & (VRAM_H - 1)) * VRAM_STRIDE], clut, tex_x, clut_x, u, depth);
 
         gpu_interp_step(iu, d);
         gpu_interp_step(iv, d);
@@ -789,7 +810,7 @@ GPU_INLINE void gpu_span_flat_tri(const Mode *m, u16 *dst, int y, int n, Interp 
         if (depth) {
             int u = ((au + iu.q) & u_and) | u_or, v = ((av + iv.q) & v_and) | v_or;
 
-            t = gpu_fetch(&gpu_vram[((tex_y + v) & 511) * VRAM_STRIDE], clut, tex_x, clut_x, u, depth);
+            t = gpu_fetch(&gpu_vram[((tex_y + v) & (VRAM_H - 1)) * VRAM_STRIDE], clut, tex_x, clut_x, u, depth);
             gpu_interp_step(&iu, d);
             gpu_interp_step(&iv, d);
             if (t == 0) {
@@ -822,7 +843,7 @@ GPU_INLINE void gpu_span_gouraud_neon(const Mode *m, u16 *dst, int y, int n, con
     int cached = 0;
     int i = 0;
 
-    if (m->textured == 1 && clut_x + 16 <= VRAM_W && (y & 511) != m->clut_y) {
+    if (m->textured == 1 && clut_x + 16 <= VRAM_W && (y & VRAM_YMASK) != m->clut_y) {
         int k;
 
         for (k = 0; k < 16; k++) {
@@ -851,7 +872,7 @@ GPU_INLINE void gpu_span_gouraud_neon(const Mode *m, u16 *dst, int y, int n, con
             u = ((au + iu.q) & u_and) | u_or;
             v = ((av + iv.q) & v_and) | v_or;
             if (v != last_v) {
-                row = &gpu_vram[((tex_y + v) & 511) * VRAM_STRIDE];
+                row = &gpu_vram[((tex_y + v) & (VRAM_H - 1)) * VRAM_STRIDE];
                 last_v = v;
             }
             if (cached) {
@@ -894,7 +915,7 @@ GPU_INLINE void gpu_span_gouraud_neon(const Mode *m, u16 *dst, int y, int n, con
         gpu_interp_step(&ib, d);
         u = ((au + iu.q) & u_and) | u_or;
         v = ((av + iv.q) & v_and) | v_or;
-        t = gpu_fetch(&gpu_vram[((tex_y + v) & 511) * VRAM_STRIDE], clut, tex_x, clut_x, u, m->textured);
+        t = gpu_fetch(&gpu_vram[((tex_y + v) & (VRAM_H - 1)) * VRAM_STRIDE], clut, tex_x, clut_x, u, m->textured);
         gpu_interp_step(&iu, d);
         gpu_interp_step(&iv, d);
         if (t != 0) {
@@ -951,7 +972,7 @@ GPU_INLINE void gpu_span_gouraud_tri(const Mode *m, u16 *dst, int x, int y, int 
         if (depth) {
             int u = ((au + iu.q) & u_and) | u_or, v = ((av + iv.q) & v_and) | v_or;
 
-            t = gpu_fetch(&gpu_vram[((tex_y + v) & 511) * VRAM_STRIDE], clut, tex_x, clut_x, u, depth);
+            t = gpu_fetch(&gpu_vram[((tex_y + v) & (VRAM_H - 1)) * VRAM_STRIDE], clut, tex_x, clut_x, u, depth);
             gpu_interp_step(&iu, d);
             gpu_interp_step(&iv, d);
             if (t == 0) {
@@ -1707,7 +1728,7 @@ static void gpu_polygon(const u32 *w) {
             vx[i].v = (w[k] >> 8) & 0xFF;
             if (i == 0) {
                 m.clut_x = ((w[k] >> 16) & 0x3F) * 16;
-                m.clut_y = (w[k] >> 22) & 0x1FF;
+                m.clut_y = (w[k] >> 22) & VRAM_YMASK;
             } else if (i == 1) {
                 gpu_apply_texpage(w[k] >> 16);
             }
@@ -1750,7 +1771,7 @@ static void gpu_rectangle(const u32 *w) {
         u0 = w[2] & 0xFF;
         v0 = (w[2] >> 8) & 0xFF;
         m.clut_x = ((w[2] >> 16) & 0x3F) * 16;
-        m.clut_y = (w[2] >> 22) & 0x1FF;
+        m.clut_y = (w[2] >> 22) & VRAM_YMASK;
         if (m.raw) {
             r = gg = b = 128; /* the same pixels as raw (the span loops' comment) */
         }
@@ -1815,7 +1836,7 @@ static void gpu_rectangle(const u32 *w) {
     }
     kind = gpu_flat_kind(&m, r, gg, b);
     for (y = ys; y < ye; y++) {
-        int tv = (m.tex_y + (((v0 + (y - y0)) & m.v_and) | m.v_or)) & 511;
+        int tv = (m.tex_y + (((v0 + (y - y0)) & m.v_and) | m.v_or)) & (VRAM_H - 1);
         const u16 *row = &gpu_vram[tv * VRAM_STRIDE];
         u16 *dst = &gpu_vram[y * VRAM_STRIDE + xs];
         int u = u0 + (xs - x0);
@@ -1940,9 +1961,9 @@ static void gpu_line_mode(Mode *m, u32 code) {
 static void gpu_fill(const u32 *w) {
     u16 c = (u16)(((w[0] >> 3) & 0x1F) | (((w[0] >> 11) & 0x1F) << 5) | (((w[0] >> 19) & 0x1F) << 10));
     int x0 = w[1] & 0x3F0;
-    int y0 = (w[1] >> 16) & 0x1FF;
+    int y0 = (w[1] >> 16) & VRAM_YMASK;
     int width = ((w[2] & 0x3FF) + 0xF) & ~0xF;
-    int height = (w[2] >> 16) & 0x1FF;
+    int height = (w[2] >> 16) & VRAM_YMASK;
     int x, y;
 
     if (gpu_listener != NULL) {
@@ -1957,34 +1978,34 @@ static void gpu_fill(const u32 *w) {
         gpu_listener(&ev);
     }
     for (y = 0; y < height; y++) {
-        u16 *row = &gpu_vram[((y0 + y) & 511) * VRAM_STRIDE];
+        u16 *row = &gpu_vram[((y0 + y) & VRAM_YMASK) * VRAM_STRIDE];
 
         for (x = 0; x < width; x++) {
             row[(x0 + x) & 1023] = c;
         }
-        gpu_touch((y0 + y) & 511, 0, VRAM_W);
+        gpu_touch((y0 + y) & VRAM_YMASK, 0, VRAM_W);
     }
 }
 
 /* GP0 80h: VRAM to VRAM, pixel by pixel, wrapping at the edges, with the mask rules. */
 static void gpu_copy(const u32 *w) {
-    int sx = w[1] & 0x3FF, sy = (w[1] >> 16) & 0x1FF;
-    int dx = w[2] & 0x3FF, dy = (w[2] >> 16) & 0x1FF;
+    int sx = w[1] & 0x3FF, sy = (w[1] >> 16) & VRAM_YMASK;
+    int dx = w[2] & 0x3FF, dy = (w[2] >> 16) & VRAM_YMASK;
     int width = (((w[3] & 0xFFFF) - 1) & 0x3FF) + 1;
-    int height = ((((w[3] >> 16) & 0xFFFF) - 1) & 0x1FF) + 1;
+    int height = ((((w[3] >> 16) & 0xFFFF) - 1) & VRAM_YMASK) + 1;
     int x, y;
 
     for (y = 0; y < height; y++) {
         for (x = 0; x < width; x++) {
-            u16 p = gpu_vram[((sy + y) & 511) * VRAM_STRIDE + ((sx + x) & 1023)];
-            u16 *d = &gpu_vram[((dy + y) & 511) * VRAM_STRIDE + ((dx + x) & 1023)];
+            u16 p = gpu_vram[((sy + y) & VRAM_YMASK) * VRAM_STRIDE + ((sx + x) & 1023)];
+            u16 *d = &gpu_vram[((dy + y) & VRAM_YMASK) * VRAM_STRIDE + ((dx + x) & 1023)];
 
             if (g.check_mask && (*d & 0x8000)) {
                 continue;
             }
             *d = p | g.set_mask;
         }
-        gpu_touch((dy + y) & 511, 0, VRAM_W);
+        gpu_touch((dy + y) & VRAM_YMASK, 0, VRAM_W);
     }
     if (gpu_listener != NULL) {
         GpuEvent ev;
@@ -2020,7 +2041,7 @@ static void gpu_load_done(void) {
 
 static void gpu_load_pixel(u16 p) {
     int x = (g.load_x + g.load_i % g.load_w) & 1023;
-    int y = (g.load_y + g.load_i / g.load_w) & 511;
+    int y = (g.load_y + g.load_i / g.load_w) & VRAM_YMASK;
     u16 *d = &gpu_vram[y * VRAM_STRIDE + x];
 
     g.load_i++;
@@ -2120,9 +2141,9 @@ static void gpu_execute_body(void) {
         return;
     case 5:
         g.load_x = w[1] & 0x3FF;
-        g.load_y = (w[1] >> 16) & 0x1FF;
+        g.load_y = (w[1] >> 16) & VRAM_YMASK;
         g.load_w = (((w[2] & 0xFFFF) - 1) & 0x3FF) + 1;
-        g.load_h = ((((w[2] >> 16) & 0xFFFF) - 1) & 0x1FF) + 1;
+        g.load_h = ((((w[2] >> 16) & 0xFFFF) - 1) & VRAM_YMASK) + 1;
         g.load_i = 0;
         g.load_left = g.load_w * g.load_h;
         if (port_gpu_log_on) {
@@ -2134,7 +2155,7 @@ static void gpu_execute_body(void) {
     case 7:
         switch (code) {
         case 0xE1:
-            g.texpage = w[0] & 0x1FF;
+            g.texpage = w[0] & gpu_page_bits;
             g.dither = (w[0] >> 9) & 1;
             g.dfe = (w[0] >> 10) & 1;
             return;
@@ -2256,7 +2277,7 @@ static void gpu_load_image_body(int x, int y, int w, int h, const u16 *pixels) {
         int row, x;
 
         for (row = 0, i = 0; row < g.load_h; row++) {
-            int y = (g.load_y + row) & 511;
+            int y = (g.load_y + row) & VRAM_YMASK;
             u16 *line = &gpu_vram[y * VRAM_STRIDE];
 
             for (x = 0; x < g.load_w; x++) {
@@ -2459,7 +2480,10 @@ void port_gpu_log_frame(void) {
 void gpu_state(PortState *s) {
     int y;
 
-    port_state_bytes(s, "gpu_vram", gpu_vram, sizeof(gpu_vram));
+    port_state_bytes(s, "gpu_vram", gpu_vram, (size_t)VRAM_STRIDE * 512 * sizeof(u16));
+    if (gpu_rows > 512) {
+        port_state_bytes(s, "gpu_vram_ext", &gpu_vram[VRAM_STRIDE * 512], (size_t)VRAM_STRIDE * 512 * sizeof(u16));
+    }
     port_state_bytes(s, "gpu", &g, sizeof(g));
     if (port_state_loading(s)) {
         for (y = 0; y < VRAM_H; y++) {

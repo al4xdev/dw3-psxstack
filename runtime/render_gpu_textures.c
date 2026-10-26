@@ -40,7 +40,7 @@
 #include "sha1.h"
 
 #define VRAM_W 1024
-#define VRAM_H 512
+#define VRAM_H 1024 /* the rows kept; gpu.c's VRAM has gpu_vram_rows() of them (512, or 1024 extended) */
 #define TILE 16
 #define RING 65536          /* the transfers remembered: a word of an older one has no key */
 #define CLUT_CACHE 256
@@ -113,7 +113,7 @@ static void tex_hash_row(PortSha1 *c, const u16 *vram, int x, int y, int w) {
     u8 buf[2 * VRAM_W];
     int i;
     for (i = 0; i < w; i++) {
-        u16 p = vram[(y & 511) * psyq_gpu_vram_stride() + ((x + i) & 1023)];
+        u16 p = vram[(y & (gpu_vram_rows() - 1)) * psyq_gpu_vram_stride() + ((x + i) & 1023)];
         buf[2 * i] = (u8)p;
         buf[2 * i + 1] = (u8)(p >> 8);
     }
@@ -127,11 +127,11 @@ static int tex_wrap(int d, int size) {
 /* ---- The owner map ---- */
 
 static void own_set(int x, int y, int w, int h, u32 seq) {
-    int i, j;
+    int i, j, rows = gpu_vram_rows();
     w = SDL_min(w, VRAM_W);
-    h = SDL_min(h, VRAM_H);
+    h = SDL_min(h, rows);
     for (j = 0; j < h; j++) {
-        int yy = (y + j) & 511;
+        int yy = (y + j) & (rows - 1);
         for (i = 0; i < w; i++) {
             int xx = (x + i) & 1023;
             t.own[yy][xx] = seq;
@@ -165,21 +165,21 @@ static void own_clear_clipped(int x0, int y0, int x1, int y1) {
 
 /* The same over a rectangle that wraps at the VRAM's edges. */
 static void own_clear(int x, int y, int w, int h) {
-    int xs[2][2], ys[2][2], nx = 1, ny = 1, i, j;
+    int xs[2][2], ys[2][2], nx = 1, ny = 1, i, j, rows = gpu_vram_rows();
     if (w <= 0 || h <= 0) {
         return;
     }
     x &= 1023;
-    y &= 511;
+    y &= rows - 1;
     w = SDL_min(w, VRAM_W);
-    h = SDL_min(h, VRAM_H);
+    h = SDL_min(h, rows);
     xs[0][0] = x, xs[0][1] = SDL_min(x + w, VRAM_W) - 1;
     if (x + w > VRAM_W) {
         xs[1][0] = 0, xs[1][1] = x + w - VRAM_W - 1, nx = 2;
     }
-    ys[0][0] = y, ys[0][1] = SDL_min(y + h, VRAM_H) - 1;
-    if (y + h > VRAM_H) {
-        ys[1][0] = 0, ys[1][1] = y + h - VRAM_H - 1, ny = 2;
+    ys[0][0] = y, ys[0][1] = SDL_min(y + h, rows) - 1;
+    if (y + h > rows) {
+        ys[1][0] = 0, ys[1][1] = y + h - rows - 1, ny = 2;
     }
     for (j = 0; j < ny; j++) {
         for (i = 0; i < nx; i++) {
@@ -193,7 +193,7 @@ static void own_clear_drawn(const GpuEvent *ev, int x0, int y0, int x1, int y1) 
     x0 = SDL_max(SDL_max(x0, ev->area_x0), 0);
     y0 = SDL_max(SDL_max(y0, ev->area_y0), 0);
     x1 = SDL_min(SDL_min(x1, ev->area_x1), VRAM_W - 1);
-    y1 = SDL_min(SDL_min(y1, ev->area_y1), VRAM_H - 1);
+    y1 = SDL_min(SDL_min(y1, ev->area_y1), 511);
     if (x0 <= x1 && y0 <= y1) {
         own_clear_clipped(x0, y0, x1, y1);
     }
@@ -605,12 +605,12 @@ int render_gpu_tex_key(const GpuEvent *ev, int u_lo, int u_hi, int v_lo, int v_h
     shift = shifts[ev->textured];
     x0 = u_lo >> shift;
     x1 = u_hi >> shift;
-    seq = t.own[(ev->tex_y + v_lo) & 511][(ev->tex_x + x0) & 1023];
+    seq = t.own[(ev->tex_y + v_lo) & (VRAM_H - 1)][(ev->tex_x + x0) & 1023];
     if (seq == 0 || t.loads[seq & (RING - 1)].seq != seq) {
         return 0;
     }
     for (j = v_lo; j <= v_hi; j++) {
-        const u32 *row = t.own[(ev->tex_y + j) & 511];
+        const u32 *row = t.own[(ev->tex_y + j) & (VRAM_H - 1)];
         for (i = x0; i <= x1; i++) {
             if (row[(ev->tex_x + i) & 1023] != seq) {
                 return 0;
@@ -623,7 +623,7 @@ int render_gpu_tex_key(const GpuEvent *ev, int u_lo, int u_hi, int v_lo, int v_h
     key->w = l->w << shift;
     key->h = l->h;
     key->u0 = tex_wrap(l->x - ev->tex_x, VRAM_W) * (1 << shift);
-    key->v0 = tex_wrap(l->y - ev->tex_y, VRAM_H);
+    key->v0 = tex_wrap(l->y - ev->tex_y, gpu_vram_rows());
     key->vx = l->x;
     key->vy = l->y;
     key->clut = ev->textured < 3 ? clut_hash(ev->clut_x, ev->clut_y, ev->textured == 1 ? 16 : 256) : 0;
@@ -700,7 +700,7 @@ void render_gpu_tex_event(const GpuEvent *ev) {
         break;
     case GPU_EV_LOAD: {
         const u16 *vram = gpu_vram_pixels();
-        int w = SDL_min(ev->w, VRAM_W), h = SDL_min(ev->h, VRAM_H), j;
+        int rows = gpu_vram_rows(), w = SDL_min(ev->w, VRAM_W), h = SDL_min(ev->h, rows), j;
         PortSha1 sha;
         TexLoad *l;
         if (w <= 0 || h <= 0) {
@@ -717,7 +717,7 @@ void render_gpu_tex_event(const GpuEvent *ev) {
         l->seq = t.seq;
         l->hash = tex_digest64(&sha);
         l->x = ev->x & 1023;
-        l->y = ev->y & 511;
+        l->y = ev->y & (rows - 1);
         l->w = w;
         l->h = h;
         own_set(l->x, l->y, w, h, t.seq);
@@ -726,7 +726,7 @@ void render_gpu_tex_event(const GpuEvent *ev) {
             for (j = 0; j < h; j++) {
                 int i;
                 for (i = 0; i < w; i++) {
-                    img->pixels[j * w + i] = vram[((l->y + j) & 511) * psyq_gpu_vram_stride() + ((l->x + i) & 1023)];
+                    img->pixels[j * w + i] = vram[((l->y + j) & (rows - 1)) * psyq_gpu_vram_stride() + ((l->x + i) & 1023)];
                 }
             }
         }

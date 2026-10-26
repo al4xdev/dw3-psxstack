@@ -437,7 +437,7 @@ static int psyq_gpu_clear(RECT *rect, u8 r, u8 g, u8 b, int dfe) {
     u32 n = 0;
 
     gpu_draw_state(&e1, &e3, &e4, &e5);
-    e1 = (e1 & 0xFF0007FFu) | ((u32)dfe << 10);
+    e1 = (e1 & 0xFF000FFFu) | ((u32)dfe << 10);
     w[n++] = 0xE6000000u;
     w[n++] = e1;
     if ((rect->x & 0x3F) != 0 || (cw & 0x3F) != 0) {
