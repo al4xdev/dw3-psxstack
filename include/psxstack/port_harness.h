@@ -180,6 +180,7 @@ void port_audio_pause(int paused); /* the device paused (the pump's pause); noth
 /* The device muted (fast-forward): its queue cleared, then the samples rendered but not queued; unmuted, the queue
  * starts again from its target. The WAV and the SPU never change. */
 void port_audio_set_mute(int mute);
+void port_audio_resync(void);
 
 /* ---- mods.c: the built-in mods (docs/LAUNCHER.md "Mod manifest", "Mod runtime") ----
  * port_mods_settings: the settings' `mods` section (NULL: every mod off) read against the registry; a bad value fails

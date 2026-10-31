@@ -371,7 +371,25 @@ void port_audio_frame(void) {
     }
 #elif defined(PSXSTACK_SDL2)
     if (audio_dev != 0 && !audio_muted) {
-        SDL_QueueAudio(audio_dev, audio_buf, (Uint32)(frames * 4));
+        /* Bounded queue: cap at ~150 ms (~26 KB) to prevent cumulative drift over long gameplay. */
+        Uint32 q = SDL_GetQueuedAudioSize(audio_dev);
+        if (q < (Uint32)(SPU_RATE * 4 * 0.150)) {
+            SDL_QueueAudio(audio_dev, audio_buf, (Uint32)(frames * 4));
+        }
+    }
+#endif
+}
+
+void port_audio_resync(void) {
+#ifdef PSXSTACK_SDL
+    if (audio_stream != NULL) {
+        SDL_ClearAudioStream(audio_stream);
+        audio_started = 0;
+        audio_avg = audio_target;
+    }
+#elif defined(PSXSTACK_SDL2)
+    if (audio_dev != 0) {
+        SDL_ClearQueuedAudio(audio_dev);
     }
 #endif
 }

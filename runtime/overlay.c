@@ -244,6 +244,9 @@ void *port_overlay_load(int tier, s32 file, void *dst, const void *src, u32 size
         port_log("overlay: tier %d, file 0x%X, %s (%d functions; .data %zu, .bss %zu bytes restored)", tier, file,
                  o->name, o->func_count, data, bss);
         port_overlay_copy_time(size);
+        if (tier == 1) {
+            port_audio_resync();
+        }
         return dst;
     }
     /* Not code: a data file into the slot buffer, exactly the PS1's memcpy (a sector-rounded size may run past the
