@@ -1,6 +1,8 @@
 # The build's version stamp (docs/PORT.md "Crash report"): `git describe` over the release tags (vX.Y.Z, as the
 # packages are named), "dev-<commit>" before any, "-dirty" with uncommitted changes, and the commit's hash;
-# PSXSTACK_VERSION (the release's tag) wins over git describe. Run at every build (cmake -P, from a custom command of
+# PSXSTACK_VERSION (the release's tag) wins over git describe. A cross build whose image has no
+# git passes PSXSTACK_COMMIT (full hash) and PSXSTACK_VERSION (dev-<short>, dirty if the tree is).
+# Run at every build (cmake -P, from a custom command of
 # the port's and the launcher's CMakeLists), it rewrites OUT only when the text changed, so a build with nothing new
 # relinks nothing. ROOT is the repository the build is named after: a game repo passes its own.
 #
@@ -34,6 +36,10 @@ if(GIT_FOUND)
             endif()
         endif()
     endif()
+endif()
+# Host-supplied stamp, for a build container that cannot run git.
+if(commit STREQUAL "unknown" AND NOT "$ENV{PSXSTACK_COMMIT}" STREQUAL "")
+    set(commit "$ENV{PSXSTACK_COMMIT}")
 endif()
 if(NOT version)
     set(version "unknown")
