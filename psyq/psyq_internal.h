@@ -82,9 +82,8 @@ void psyq_gte_swc2_(void *p, int reg);
  * only (GP1(00h)); gpu_gp0_write takes one GP0 word (a command, its parameters, a transfer's pixels), gpu_gp0_words a
  * run of them (a DMA packet); gpu_load_image is a whole CPU-to-VRAM transfer (LoadImage); gpu_vram_pixels is the
  * VRAM, gpu_vram_stride() pixels per row (1024 visible, plus padding: the rows are not a power of two apart, or a
- * texture walk down v would thrash one L1 set); gpu_draw_state the current E1/E3/E4/E5 words. */
- * VRAM, 1024 pixels per row, gpu_vram_rows rows (512, or 1024 after gpu_vram_extend: gpu.c "The extension"); gpu_draw_state
- * the current E1/E3/E4/E5 words. */
+ * texture walk down v would thrash one L1 set), gpu_vram_rows rows (512, or 1024 after gpu_vram_extend: gpu.c "The
+ * extension"); gpu_draw_state the current E1/E3/E4/E5 words. */
 void gpu_power_on(void);
 void gpu_reset_state(void);
 void gpu_gp0_write(u32 word);
