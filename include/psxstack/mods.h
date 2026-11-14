@@ -21,7 +21,7 @@ typedef struct PortModOption {
     const char *applies;        /* "live" or "restart" */
 } PortModOption;
 
-#define PORT_MOD_MAX_OPTIONS 8
+#define PORT_MOD_MAX_OPTIONS 12
 
 typedef struct PortModValue {
     double number;          /* bool (0/1), int, float, enum (the value's index) */
