@@ -75,7 +75,9 @@ static struct {
 static int video_shot_count;
 static long video_converted_frame = -1; /* the frame video_pixels was converted at (the debug channel's screenshot) */
 static int video_gpu_wanted;            /* --renderer gpu / video.renderer "gpu" */
+#if defined(PSXSTACK_EGL) || defined(PSXSTACK_SDL2)
 static int video_gles_wanted;           /* --renderer gles: the offscreen GLES renderer (render_gles.c) */
+#endif
 #ifdef PSXSTACK_EGL /* only the GLES paths read it: unused (-Werror) in the other builds */
 static int video_gles;                  /* the offscreen GLES renderer draws; the present still comes out through fbdev */
 #endif
@@ -217,7 +219,9 @@ static int video_try_ppm(const char *path) {
 int port_video_set_renderer(const char *name) {
     if (strcmp(name, "software") == 0 || strcmp(name, "gpu") == 0 || strcmp(name, "gles") == 0) {
         video_gpu_wanted = strcmp(name, "gpu") == 0; /* not "gles": that one is offscreen and has its own flag */
+#if defined(PSXSTACK_EGL) || defined(PSXSTACK_SDL2)
         video_gles_wanted = strcmp(name, "gles") == 0;
+#endif
         return 1;
     }
     return 0;

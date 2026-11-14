@@ -605,8 +605,10 @@ GPU_INLINE void gpu_interp_step(Interp *it, int d) {
 
 /* The vector spans' escape hatches (DW3_NO_NEON_GOURAUD=1, DW3_NO_NEON_FLAT=1): the scalar path, to time the two on
  * one build and to recover from a vector path that misbehaves without a rebuild. */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
 static int gpu_neon_gouraud_off = -1;
 static int gpu_neon_flat_off = -1;
+#endif
 static unsigned gpu_log_neon_spans;   /* spans drawn by the vector paths (DW3_GPU_LOG) */
 static unsigned gpu_log_scalar_spans; /* spans drawn by the scalar ones */
 static unsigned gpu_log_flat_opaque;  /* flat spans the vector path could take (opaque and textured) */
@@ -2297,11 +2299,13 @@ static FILE *gpu_log_file;
 
 void port_gpu_log_init(void) {
     const char *env = getenv("DW3_GPU_LOG");
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
     const char *nogour = getenv("DW3_NO_NEON_GOURAUD");
     const char *noflat = getenv("DW3_NO_NEON_FLAT");
 
     gpu_neon_gouraud_off = nogour != NULL && nogour[0] == '1';
     gpu_neon_flat_off = noflat != NULL && noflat[0] == '1';
+#endif
     if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0) {
         return;
     }

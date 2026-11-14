@@ -324,7 +324,10 @@ function(psxstack_add_game target)
     endif()
     # The software GPU runs every frame: optimised in every build (-O3: its span loops rely on inlining and on the
     # vectorised select loops; psyq/gpu.c). The SPU core renders every audio frame: -O2 (runtime/spu*.c).
-    set_property(SOURCE "${PSXSTACK_ROOT}/psyq/gpu.c" APPEND PROPERTY COMPILE_OPTIONS -O3 -Wno-aggressive-loop-optimizations)
+    set_property(SOURCE "${PSXSTACK_ROOT}/psyq/gpu.c" APPEND PROPERTY COMPILE_OPTIONS -O3)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        set_property(SOURCE "${PSXSTACK_ROOT}/psyq/gpu.c" APPEND PROPERTY COMPILE_OPTIONS -Wno-aggressive-loop-optimizations)
+    endif()
     # The movie decoder and the geometry engine run every frame of a cutscene or a battle setup, and the rest of
     # this target has no -O flag (GCC's -O0). -O2 here is the cheap experiment; the game's own C stays as it was.
     set_property(SOURCE "${PSXSTACK_ROOT}/psyq/mdec.c" "${PSXSTACK_ROOT}/psyq/gte.c" "${PSXSTACK_ROOT}/psyq/libgte.c"
