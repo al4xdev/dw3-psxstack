@@ -203,6 +203,22 @@ static long number(const char *s, const char *opt) {
     return v;
 }
 
+static void status_emit(const char *tag) {
+    const char *e = getenv("DW3_STATUS_FD");
+    int fd;
+    if (e == NULL || e[0] == '\0') {
+        return;
+    }
+    fd = atoi(e);
+    if (fd > 2) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%s\n", tag);
+        if (n > 0) {
+            (void)write(fd, buf, (size_t)n);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     const char *disc = NULL, *script = NULL, *log = NULL, *record = NULL, *speed = NULL;
     const char *memcard[2] = { NULL, NULL };
@@ -492,6 +508,7 @@ int main(int argc, char **argv) {
         return 64;
     }
     if (disc != NULL) {
+        status_emit("disc");
         port_disc_open(disc, disc_check);
     }
     for (i = 0; i < 2; i++) {
@@ -516,6 +533,7 @@ int main(int argc, char **argv) {
         if (!max_frames_given) {
             port_max_frames = 0; /* a window runs until it is closed */
         }
+        status_emit("start");
         port_video_open(scale, fullscreen);
         port_input_init(input_test);
     } else {
