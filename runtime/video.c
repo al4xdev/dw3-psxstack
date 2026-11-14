@@ -676,6 +676,37 @@ int port_fbdev_active(void) {
     return fbdev_active;
 }
 
+static void video_init_gles_if_wanted(void) {
+#ifdef PSXSTACK_EGL
+    if (video_gles_wanted && !video_gles) {
+        char gles_why[160] = {0};
+        const char *replace_env = getenv("DW3_GLES_REPLACE");
+        const char *check_env = getenv("DW3_GLES_CHECK");
+
+        /* DW3_GLES_REPLACE=0 keeps the CPU drawing as well, so the VRAM check can compare the two.
+         * DW3_GLES_CHECK=N compares the whole target against the shim's VRAM every N frames and logs the
+         * first differing pixel. Both are measurement switches, not settings. */
+        video_gles_check_every = check_env != NULL ? atoi(check_env) : 0;
+        if (replace_env != NULL && replace_env[0] == '0') {
+            render_gles_set_replace(0);
+        }
+        if (render_gles_open(gles_why, sizeof(gles_why)) &&
+            render_gles_raster_start(1, gles_why, sizeof(gles_why))) {
+            video_gles = 1;
+            port_log("renderer: gles (%s)%s%s", render_gles_describe(),
+                     video_gles_check_every > 0 ? ", vram check every " : "",
+                     video_gles_check_every > 0 ? check_env : "");
+        } else {
+            port_log("renderer: gles unavailable (%s); the software renderer draws", gles_why);
+        }
+    }
+#elif defined(PSXSTACK_SDL2)
+    if (video_gles_wanted) {
+        port_log("renderer: gles needs -DPSXSTACK_EGL=ON; the software renderer draws");
+    }
+#endif
+}
+
 void port_video_open(int scale, int fullscreen) {
     (void)scale;
     const char *video_env = getenv("DW3_VIDEO");
@@ -693,37 +724,7 @@ void port_video_open(int scale, int fullscreen) {
             video_start_ms = SDL_GetTicks();
             port_log("video: direct fbdev opened (/dev/fb0, %ux%u %ubpp, NEON 2x scaling)",
                      fbdev.xres, fbdev.yres, fbdev.bits_per_pixel);
-#ifdef PSXSTACK_EGL
-            if (video_gles_wanted) {
-                /* The offscreen renderer draws; the picture still leaves through fbdev (a window swap costs 17 ms on
-                 * this handheld, the fb0 present 0.77 ms: docs/gpu/measurements.txt). */
-                char gles_why[160] = {0};
-
-                const char *replace_env = getenv("DW3_GLES_REPLACE");
-                const char *check_env = getenv("DW3_GLES_CHECK");
-
-                /* DW3_GLES_REPLACE=0 keeps the CPU drawing as well, so the VRAM check can compare the two.
-                 * DW3_GLES_CHECK=N compares the whole target against the shim's VRAM every N frames and logs the
-                 * first differing pixel. Both are measurement switches, not settings. */
-                video_gles_check_every = check_env != NULL ? atoi(check_env) : 0;
-                if (replace_env != NULL && replace_env[0] == '0') {
-                    render_gles_set_replace(0);
-                }
-                if (render_gles_open(gles_why, sizeof(gles_why)) &&
-                    render_gles_raster_start(1, gles_why, sizeof(gles_why))) {
-                    video_gles = 1;
-                    port_log("renderer: gles (%s)%s%s", render_gles_describe(),
-                             video_gles_check_every > 0 ? ", vram check every " : "",
-                             video_gles_check_every > 0 ? check_env : "");
-                } else {
-                    port_log("renderer: gles unavailable (%s); the software renderer draws", gles_why);
-                }
-            }
-#elif defined(PSXSTACK_SDL2)
-            if (video_gles_wanted) {
-                port_log("renderer: gles needs -DPSXSTACK_EGL=ON; the software renderer draws");
-            }
-#endif
+            video_init_gles_if_wanted();
             return;
         } else {
             port_log("video: fbdev open failed (%s); falling back to SDL2", why);
@@ -731,10 +732,13 @@ void port_video_open(int scale, int fullscreen) {
     }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) < 0) {
-        port_fatal("SDL_Init: %s", SDL_GetError());
+        port_log("video: SDL full init failed (%s); retrying video-only", SDL_GetError());
+        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+            port_fatal("SDL_Init: %s", SDL_GetError());
+        }
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
-    Uint32 flags = fullscreen ? SDL_WINDOW_FULLSCREEN : 0;
+    Uint32 flags = fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
     video_window = SDL_CreateWindow(PSXSTACK_GAME_ID, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                     640, 480, flags);
     if (video_window == NULL) {
@@ -757,6 +761,7 @@ void port_video_open(int scale, int fullscreen) {
              SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL,
              SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "unknown",
              rinfo.name ? rinfo.name : "unknown", fullscreen ? " (fullscreen)" : "");
+    video_init_gles_if_wanted();
 }
 
 void port_video_toggle_fullscreen(void) {

@@ -18,6 +18,7 @@
  * The present (display pass into RGB565, read back, memcpy into /dev/fb0) is M1d and lands with the video wiring. */
 #ifdef PSXSTACK_EGL
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -40,6 +41,250 @@
 #ifndef EGL_PLATFORM_GBM_KHR
 #define EGL_PLATFORM_GBM_KHR 0x31D7
 #endif
+#ifndef EGL_PLATFORM_SURFACELESS_MESA
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#endif
+
+/* Loaded dynamically via dlopen() so --renderer software starts even when libgbm/libEGL are absent. */
+static void *gles_so_egl;
+static void *gles_so_gl;
+static void *gles_so_gbm;
+
+static struct {
+    struct gbm_device *(*gbm_create_device)(int fd);
+    void (*gbm_device_destroy)(struct gbm_device *gbm);
+
+    EGLBoolean (EGLAPIENTRY *eglBindAPI)(EGLenum api);
+    EGLBoolean (EGLAPIENTRY *eglChooseConfig)(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig *configs, EGLint config_size, EGLint *num_config);
+    EGLContext (EGLAPIENTRY *eglCreateContext)(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list);
+    EGLSurface (EGLAPIENTRY *eglCreatePbufferSurface)(EGLDisplay dpy, EGLConfig config, const EGLint *attrib_list);
+    EGLBoolean (EGLAPIENTRY *eglDestroyContext)(EGLDisplay dpy, EGLContext ctx);
+    EGLBoolean (EGLAPIENTRY *eglDestroySurface)(EGLDisplay dpy, EGLSurface surface);
+    EGLDisplay (EGLAPIENTRY *eglGetDisplay)(EGLNativeDisplayType display_id);
+    EGLint (EGLAPIENTRY *eglGetError)(void);
+    __eglMustCastToProperFunctionPointerType (EGLAPIENTRY *eglGetProcAddress)(const char *procname);
+    EGLBoolean (EGLAPIENTRY *eglInitialize)(EGLDisplay dpy, EGLint *major, EGLint *minor);
+    EGLBoolean (EGLAPIENTRY *eglMakeCurrent)(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
+    EGLBoolean (EGLAPIENTRY *eglTerminate)(EGLDisplay dpy);
+
+    void (GL_APIENTRY *glActiveTexture)(GLenum texture);
+    void (GL_APIENTRY *glAttachShader)(GLuint program, GLuint shader);
+    void (GL_APIENTRY *glBindBuffer)(GLenum target, GLuint buffer);
+    void (GL_APIENTRY *glBindFramebuffer)(GLenum target, GLuint framebuffer);
+    void (GL_APIENTRY *glBindTexture)(GLenum target, GLuint texture);
+    void (GL_APIENTRY *glBindVertexArray)(GLuint array);
+    void (GL_APIENTRY *glBlitFramebuffer)(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
+    void (GL_APIENTRY *glBufferData)(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+    GLenum (GL_APIENTRY *glCheckFramebufferStatus)(GLenum target);
+    void (GL_APIENTRY *glCompileShader)(GLuint shader);
+    GLuint (GL_APIENTRY *glCreateProgram)(void);
+    GLuint (GL_APIENTRY *glCreateShader)(GLenum type);
+    void (GL_APIENTRY *glDeleteBuffers)(GLsizei n, const GLuint *buffers);
+    void (GL_APIENTRY *glDeleteFramebuffers)(GLsizei n, const GLuint *framebuffers);
+    void (GL_APIENTRY *glDeleteProgram)(GLuint program);
+    void (GL_APIENTRY *glDeleteShader)(GLuint shader);
+    void (GL_APIENTRY *glDeleteTextures)(GLsizei n, const GLuint *textures);
+    void (GL_APIENTRY *glDeleteVertexArrays)(GLsizei n, const GLuint *arrays);
+    void (GL_APIENTRY *glDisable)(GLenum cap);
+    void (GL_APIENTRY *glDrawArrays)(GLenum mode, GLint first, GLsizei count);
+    void (GL_APIENTRY *glEnableVertexAttribArray)(GLuint index);
+    void (GL_APIENTRY *glFramebufferTexture2D)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+    void (GL_APIENTRY *glGenBuffers)(GLsizei n, GLuint *buffers);
+    void (GL_APIENTRY *glGenFramebuffers)(GLsizei n, GLuint *framebuffers);
+    void (GL_APIENTRY *glGenTextures)(GLsizei n, GLuint *textures);
+    void (GL_APIENTRY *glGenVertexArrays)(GLsizei n, GLuint *arrays);
+    GLint (GL_APIENTRY *glGetAttribLocation)(GLuint program, const GLchar *name);
+    void (GL_APIENTRY *glGetProgramiv)(GLuint program, GLenum pname, GLint *params);
+    void (GL_APIENTRY *glGetShaderInfoLog)(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog);
+    void (GL_APIENTRY *glGetShaderiv)(GLuint shader, GLenum pname, GLint *params);
+    const GLubyte *(GL_APIENTRY *glGetString)(GLenum name);
+    GLint (GL_APIENTRY *glGetUniformLocation)(GLuint program, const GLchar *name);
+    void (GL_APIENTRY *glLinkProgram)(GLuint program);
+    void *(GL_APIENTRY *glMapBufferRange)(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
+    void (GL_APIENTRY *glReadPixels)(GLint x, GLint y, GLint width, GLint height, GLenum format, GLenum type, void *pixels);
+    void (GL_APIENTRY *glShaderSource)(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length);
+    void (GL_APIENTRY *glTexImage2D)(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
+    void (GL_APIENTRY *glTexParameteri)(GLenum target, GLenum pname, GLint param);
+    void (GL_APIENTRY *glTexSubImage2D)(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels);
+    void (GL_APIENTRY *glUniform1i)(GLint location, GLint v0);
+    GLboolean (GL_APIENTRY *glUnmapBuffer)(GLenum target);
+    void (GL_APIENTRY *glUseProgram)(GLuint program);
+    void (GL_APIENTRY *glVertexAttribPointer)(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer);
+    void (GL_APIENTRY *glViewport)(GLint x, GLint y, GLsizei width, GLsizei height);
+} gles_api;
+
+static void *gles_open_so(const char *const *names) {
+    for (int i = 0; names[i] != NULL; i++) {
+        void *h = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+        if (h != NULL) {
+            return h;
+        }
+    }
+    return NULL;
+}
+
+static int gles_load_egl_gl(char *why, size_t why_size) {
+    static const char *const egl_names[] = {"libEGL.so.1", "libEGL.so", "libMali.so", NULL};
+    static const char *const gl_names[] = {"libGLESv2.so.2", "libGLESv2.so", "libMali.so", NULL};
+    static const char *const gbm_names[] = {"libgbm.so.1", "libgbm.so", "libMali.so", NULL};
+
+    if (gles_so_egl == NULL) {
+        gles_so_egl = gles_open_so(egl_names);
+    }
+    if (gles_so_gl == NULL) {
+        gles_so_gl = gles_open_so(gl_names);
+    }
+    if (gles_so_egl == NULL || gles_so_gl == NULL) {
+        snprintf(why, why_size, "libEGL/libGLESv2 unavailable");
+        return 0;
+    }
+    if (gles_so_gbm == NULL) {
+        gles_so_gbm = gles_open_so(gbm_names);
+    }
+
+#define LOAD_SYM(so, fn) do { \
+        *(void **)(&gles_api.fn) = dlsym((so), #fn); \
+        if (gles_api.fn == NULL) { \
+            snprintf(why, why_size, "missing symbol %s", #fn); \
+            return 0; \
+        } \
+    } while (0)
+#define LOAD_GL(fn) do { \
+        *(void **)(&gles_api.fn) = dlsym(gles_so_gl, #fn); \
+        if (gles_api.fn == NULL && gles_api.eglGetProcAddress != NULL) { \
+            *(void **)(&gles_api.fn) = (void *)gles_api.eglGetProcAddress(#fn); \
+        } \
+        if (gles_api.fn == NULL) { \
+            snprintf(why, why_size, "missing GL symbol %s", #fn); \
+            return 0; \
+        } \
+    } while (0)
+
+    if (gles_so_gbm != NULL) {
+        *(void **)(&gles_api.gbm_create_device) = dlsym(gles_so_gbm, "gbm_create_device");
+        *(void **)(&gles_api.gbm_device_destroy) = dlsym(gles_so_gbm, "gbm_device_destroy");
+    }
+
+    LOAD_SYM(gles_so_egl, eglBindAPI);
+    LOAD_SYM(gles_so_egl, eglChooseConfig);
+    LOAD_SYM(gles_so_egl, eglCreateContext);
+    LOAD_SYM(gles_so_egl, eglCreatePbufferSurface);
+    LOAD_SYM(gles_so_egl, eglDestroyContext);
+    LOAD_SYM(gles_so_egl, eglDestroySurface);
+    LOAD_SYM(gles_so_egl, eglGetDisplay);
+    LOAD_SYM(gles_so_egl, eglGetError);
+    LOAD_SYM(gles_so_egl, eglGetProcAddress);
+    LOAD_SYM(gles_so_egl, eglInitialize);
+    LOAD_SYM(gles_so_egl, eglMakeCurrent);
+    LOAD_SYM(gles_so_egl, eglTerminate);
+
+    LOAD_GL(glActiveTexture);
+    LOAD_GL(glAttachShader);
+    LOAD_GL(glBindBuffer);
+    LOAD_GL(glBindFramebuffer);
+    LOAD_GL(glBindTexture);
+    LOAD_GL(glBindVertexArray);
+    LOAD_GL(glBlitFramebuffer);
+    LOAD_GL(glBufferData);
+    LOAD_GL(glCheckFramebufferStatus);
+    LOAD_GL(glCompileShader);
+    LOAD_GL(glCreateProgram);
+    LOAD_GL(glCreateShader);
+    LOAD_GL(glDeleteBuffers);
+    LOAD_GL(glDeleteFramebuffers);
+    LOAD_GL(glDeleteProgram);
+    LOAD_GL(glDeleteShader);
+    LOAD_GL(glDeleteTextures);
+    LOAD_GL(glDeleteVertexArrays);
+    LOAD_GL(glDisable);
+    LOAD_GL(glDrawArrays);
+    LOAD_GL(glEnableVertexAttribArray);
+    LOAD_GL(glFramebufferTexture2D);
+    LOAD_GL(glGenBuffers);
+    LOAD_GL(glGenFramebuffers);
+    LOAD_GL(glGenTextures);
+    LOAD_GL(glGenVertexArrays);
+    LOAD_GL(glGetAttribLocation);
+    LOAD_GL(glGetProgramiv);
+    LOAD_GL(glGetShaderInfoLog);
+    LOAD_GL(glGetShaderiv);
+    LOAD_GL(glGetString);
+    LOAD_GL(glGetUniformLocation);
+    LOAD_GL(glLinkProgram);
+    LOAD_GL(glMapBufferRange);
+    LOAD_GL(glReadPixels);
+    LOAD_GL(glShaderSource);
+    LOAD_GL(glTexImage2D);
+    LOAD_GL(glTexParameteri);
+    LOAD_GL(glTexSubImage2D);
+    LOAD_GL(glUniform1i);
+    LOAD_GL(glUnmapBuffer);
+    LOAD_GL(glUseProgram);
+    LOAD_GL(glVertexAttribPointer);
+    LOAD_GL(glViewport);
+#undef LOAD_SYM
+#undef LOAD_GL
+    return 1;
+}
+
+#define gbm_create_device        gles_api.gbm_create_device
+#define gbm_device_destroy       gles_api.gbm_device_destroy
+#define eglBindAPI               gles_api.eglBindAPI
+#define eglChooseConfig          gles_api.eglChooseConfig
+#define eglCreateContext         gles_api.eglCreateContext
+#define eglCreatePbufferSurface  gles_api.eglCreatePbufferSurface
+#define eglDestroyContext        gles_api.eglDestroyContext
+#define eglDestroySurface        gles_api.eglDestroySurface
+#define eglGetDisplay            gles_api.eglGetDisplay
+#define eglGetError              gles_api.eglGetError
+#define eglGetProcAddress        gles_api.eglGetProcAddress
+#define eglInitialize            gles_api.eglInitialize
+#define eglMakeCurrent           gles_api.eglMakeCurrent
+#define eglTerminate             gles_api.eglTerminate
+#define glActiveTexture          gles_api.glActiveTexture
+#define glAttachShader           gles_api.glAttachShader
+#define glBindBuffer             gles_api.glBindBuffer
+#define glBindFramebuffer        gles_api.glBindFramebuffer
+#define glBindTexture            gles_api.glBindTexture
+#define glBindVertexArray        gles_api.glBindVertexArray
+#define glBlitFramebuffer        gles_api.glBlitFramebuffer
+#define glBufferData             gles_api.glBufferData
+#define glCheckFramebufferStatus gles_api.glCheckFramebufferStatus
+#define glCompileShader          gles_api.glCompileShader
+#define glCreateProgram          gles_api.glCreateProgram
+#define glCreateShader           gles_api.glCreateShader
+#define glDeleteBuffers          gles_api.glDeleteBuffers
+#define glDeleteFramebuffers     gles_api.glDeleteFramebuffers
+#define glDeleteProgram          gles_api.glDeleteProgram
+#define glDeleteShader           gles_api.glDeleteShader
+#define glDeleteTextures         gles_api.glDeleteTextures
+#define glDeleteVertexArrays     gles_api.glDeleteVertexArrays
+#define glDisable                gles_api.glDisable
+#define glDrawArrays             gles_api.glDrawArrays
+#define glEnableVertexAttribArray gles_api.glEnableVertexAttribArray
+#define glFramebufferTexture2D   gles_api.glFramebufferTexture2D
+#define glGenBuffers             gles_api.glGenBuffers
+#define glGenFramebuffers        gles_api.glGenFramebuffers
+#define glGenTextures            gles_api.glGenTextures
+#define glGenVertexArrays        gles_api.glGenVertexArrays
+#define glGetAttribLocation      gles_api.glGetAttribLocation
+#define glGetProgramiv           gles_api.glGetProgramiv
+#define glGetShaderInfoLog       gles_api.glGetShaderInfoLog
+#define glGetShaderiv            gles_api.glGetShaderiv
+#define glGetString              gles_api.glGetString
+#define glGetUniformLocation     gles_api.glGetUniformLocation
+#define glLinkProgram            gles_api.glLinkProgram
+#define glMapBufferRange         gles_api.glMapBufferRange
+#define glReadPixels             gles_api.glReadPixels
+#define glShaderSource           gles_api.glShaderSource
+#define glTexImage2D             gles_api.glTexImage2D
+#define glTexParameteri          gles_api.glTexParameteri
+#define glTexSubImage2D          gles_api.glTexSubImage2D
+#define glUniform1i              gles_api.glUniform1i
+#define glUnmapBuffer            gles_api.glUnmapBuffer
+#define glUseProgram             gles_api.glUseProgram
+#define glVertexAttribPointer    gles_api.glVertexAttribPointer
+#define glViewport               gles_api.glViewport
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -988,76 +1233,131 @@ int render_gles_active(void) {
     return gles_open;
 }
 
-/* Offscreen context: an EGL display on a GBM device and a pbuffer, which needs no window and no DRM master (spike #8,
- * docs/gpu/measurements.txt). 0 with the reason in why. */
-int render_gles_open(char *why, size_t why_size) {
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
-    static const EGLint cfg_attr[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                                      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-                                      EGL_NONE};
+/* Offscreen context: prefers a GBM device + pbuffer (Mali-G31) and falls back to EGL_PLATFORM_SURFACELESS_MESA
+ * (Mesa/Panfrost) or EGL_DEFAULT_DISPLAY (fbdev-only Mali blobs), which all need no window and no DRM master. */
+static int gles_try_init_display(EGLDisplay dpy, int need_pbuffer, EGLint *major, EGLint *minor, char *why, size_t why_size) {
+    static const EGLint pb_cfg[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+    static const EGLint sl_cfg[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
     static const EGLint pb_attr[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
     static const EGLint ctx_attr[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     EGLConfig cfg = NULL;
-    EGLint ncfg = 0, major = 0, minor = 0;
+    EGLint ncfg = 0;
+
+    if (dpy == EGL_NO_DISPLAY) {
+        return 0;
+    }
+    if (!eglInitialize(dpy, major, minor)) {
+        snprintf(why, why_size, "eglInitialize failed: 0x%x", (unsigned)eglGetError());
+        return 0;
+    }
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+        snprintf(why, why_size, "eglBindAPI(ES) failed: 0x%x", (unsigned)eglGetError());
+        eglTerminate(dpy);
+        return 0;
+    }
+    if (!eglChooseConfig(dpy, need_pbuffer ? pb_cfg : sl_cfg, &cfg, 1, &ncfg) || ncfg < 1) {
+        snprintf(why, why_size, "no %s config: 0x%x", need_pbuffer ? "pbuffer" : "surfaceless", (unsigned)eglGetError());
+        eglTerminate(dpy);
+        return 0;
+    }
+    if (need_pbuffer) {
+        gles_surf = eglCreatePbufferSurface(dpy, cfg, pb_attr);
+        if (gles_surf == EGL_NO_SURFACE) {
+            snprintf(why, why_size, "eglCreatePbufferSurface failed: 0x%x", (unsigned)eglGetError());
+            eglTerminate(dpy);
+            return 0;
+        }
+    } else {
+        gles_surf = EGL_NO_SURFACE;
+    }
+    gles_ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (gles_ctx == EGL_NO_CONTEXT) {
+        static const EGLint ctx2[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+
+        gles_ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx2);
+    }
+    if (gles_ctx == EGL_NO_CONTEXT) {
+        snprintf(why, why_size, "eglCreateContext failed: 0x%x", (unsigned)eglGetError());
+        if (gles_surf != EGL_NO_SURFACE) {
+            eglDestroySurface(dpy, gles_surf);
+            gles_surf = EGL_NO_SURFACE;
+        }
+        eglTerminate(dpy);
+        return 0;
+    }
+    if (!eglMakeCurrent(dpy, gles_surf, gles_surf, gles_ctx)) {
+        snprintf(why, why_size, "eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
+        eglDestroyContext(dpy, gles_ctx);
+        gles_ctx = EGL_NO_CONTEXT;
+        if (gles_surf != EGL_NO_SURFACE) {
+            eglDestroySurface(dpy, gles_surf);
+            gles_surf = EGL_NO_SURFACE;
+        }
+        eglTerminate(dpy);
+        return 0;
+    }
+    gles_dpy = dpy;
+    return 1;
+}
+
+int render_gles_open(char *why, size_t why_size) {
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
+    EGLint major = 0, minor = 0;
     const char *version, *renderer;
+    static const char *const dri_nodes[] = {"/dev/dri/renderD128", "/dev/dri/card0", "/dev/dri/card1", NULL};
 
     if (gles_open) {
         return 1;
     }
-    gles_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    if (gles_fd < 0) {
-        gles_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-        if (gles_fd < 0) {
-            snprintf(why, why_size, "no /dev/dri node (errno %d)", errno);
-            return 0;
-        }
-    }
-    gles_gbm = gbm_create_device(gles_fd);
-    if (gles_gbm == NULL) {
-        snprintf(why, why_size, "gbm_create_device failed");
-        goto fail;
+    if (!gles_load_egl_gl(why, why_size)) {
+        return 0;
     }
     get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (get_platform_display == NULL) {
-        snprintf(why, why_size, "eglGetPlatformDisplayEXT is not in this libEGL");
-        goto fail;
-    }
-    gles_dpy = get_platform_display(EGL_PLATFORM_GBM_KHR, gles_gbm, NULL);
-    if (gles_dpy == EGL_NO_DISPLAY) {
-        snprintf(why, why_size, "eglGetPlatformDisplayEXT(GBM) failed: 0x%x", (unsigned)eglGetError());
-        goto fail;
-    }
-    if (!eglInitialize(gles_dpy, &major, &minor)) {
-        snprintf(why, why_size, "eglInitialize failed: 0x%x", (unsigned)eglGetError());
-        goto fail;
-    }
-    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-        snprintf(why, why_size, "eglBindAPI(ES) failed: 0x%x", (unsigned)eglGetError());
-        goto fail;
-    }
-    if (!eglChooseConfig(gles_dpy, cfg_attr, &cfg, 1, &ncfg) || ncfg < 1) {
-        snprintf(why, why_size, "no pbuffer config: 0x%x", (unsigned)eglGetError());
-        goto fail;
-    }
-    gles_surf = eglCreatePbufferSurface(gles_dpy, cfg, pb_attr);
-    if (gles_surf == EGL_NO_SURFACE) {
-        snprintf(why, why_size, "eglCreatePbufferSurface failed: 0x%x", (unsigned)eglGetError());
-        goto fail;
-    }
-    gles_ctx = eglCreateContext(gles_dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
-    if (gles_ctx == EGL_NO_CONTEXT) {
-        /* The blob reports ES 3.2 whatever is asked for (docs/gpu/06), but keep a 2.0 fallback for other drivers. */
-        static const EGLint ctx2[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
 
-        gles_ctx = eglCreateContext(gles_dpy, cfg, EGL_NO_CONTEXT, ctx2);
+    /* 1. GBM on /dev/dri/{renderD128,card0,card1}: renderD128 first avoids opening display-only KMS on split drivers. */
+    if (gbm_create_device != NULL && gbm_device_destroy != NULL && get_platform_display != NULL) {
+        for (int i = 0; dri_nodes[i] != NULL; i++) {
+            gles_fd = open(dri_nodes[i], O_RDWR | O_CLOEXEC);
+            if (gles_fd < 0) {
+                continue;
+            }
+            gles_gbm = gbm_create_device(gles_fd);
+            if (gles_gbm != NULL) {
+                EGLDisplay dpy = get_platform_display(EGL_PLATFORM_GBM_KHR, gles_gbm, NULL);
+                if (gles_try_init_display(dpy, 1, &major, &minor, why, why_size) ||
+                    gles_try_init_display(dpy, 0, &major, &minor, why, why_size)) {
+                    break;
+                }
+                gbm_device_destroy(gles_gbm);
+                gles_gbm = NULL;
+            }
+            close(gles_fd);
+            gles_fd = -1;
+        }
     }
-    if (gles_ctx == EGL_NO_CONTEXT) {
-        snprintf(why, why_size, "eglCreateContext failed: 0x%x", (unsigned)eglGetError());
-        goto fail;
+
+    /* 2. Mesa surfaceless EGL (Panfrost / modern Mesa where GBM refuses pbuffers). */
+    if (gles_dpy == EGL_NO_DISPLAY && get_platform_display != NULL) {
+        EGLDisplay dpy = get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+        gles_try_init_display(dpy, 0, &major, &minor, why, why_size);
     }
-    if (!eglMakeCurrent(gles_dpy, gles_surf, gles_surf, gles_ctx)) {
-        snprintf(why, why_size, "eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
-        goto fail;
+
+    /* 3. Default EGL display (fbdev-only Mali blobs lacking GBM). */
+    if (gles_dpy == EGL_NO_DISPLAY) {
+        EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (!gles_try_init_display(dpy, 1, &major, &minor, why, why_size)) {
+            gles_try_init_display(dpy, 0, &major, &minor, why, why_size);
+        }
+    }
+
+    if (gles_dpy == EGL_NO_DISPLAY) {
+        if (why_size > 0 && why[0] == '\0') {
+            snprintf(why, why_size, "no usable EGL display");
+        }
+        render_gles_close();
+        return 0;
     }
     version = (const char *)glGetString(GL_VERSION);
     renderer = (const char *)glGetString(GL_RENDERER);
@@ -1065,10 +1365,6 @@ int render_gles_open(char *why, size_t why_size) {
              version != NULL ? version : "?");
     gles_open = 1;
     return 1;
-
-fail:
-    render_gles_close();
-    return 0;
 }
 
 int render_gles_raster_start(int scale, char *why, size_t why_size) {

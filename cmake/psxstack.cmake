@@ -451,12 +451,12 @@ function(psxstack_add_game target)
         set_property(SOURCE "${PSXSTACK_ROOT}/runtime/fbdev_present.c" APPEND PROPERTY COMPILE_OPTIONS -O3)
     endif()
     if(PSXSTACK_EGL)
-        # The GLES renderer (runtime/render_gles.c): offscreen EGL on a GBM device, no window (docs/gpu in the game
-        # repository). It needs the EGL, GLES and GBM headers, which embedded images have and desktops often do not,
-        # which is why it is its own option instead of riding on PSXSTACK_SDL2.
+        # The GLES renderer (runtime/render_gles.c): offscreen EGL on a GBM/surfaceless device, no window (docs/gpu in
+        # the game repository). EGL, GLESv2 and GBM are loaded at runtime via dlopen() so the binary still runs on
+        # --renderer software on CFWs/devices that lack libgbm.so.1 (e.g. fbdev-only Mali blobs).
         target_sources(${target} PRIVATE "${PSXSTACK_ROOT}/runtime/render_gles.c")
         target_compile_definitions(${target} PRIVATE PSXSTACK_EGL)
-        target_link_libraries(${target} PRIVATE EGL GLESv2 gbm)
+        target_link_libraries(${target} PRIVATE dl)
         # Every frame runs the display readback and its 8-to-5-bit conversion; at the runtime's default -O0 that loop
         # cost 7.5 ms of a 20 ms frame on the handheld (measured with DW3_GLES_LOG). -O3 turns the three /255 into
         # multiply-shifts.

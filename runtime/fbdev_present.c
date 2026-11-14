@@ -123,6 +123,14 @@ int Fbdev_Present(FbdevPresent *fb, const uint32_t *pixels, int stride, int widt
 
     int scale_x = (width <= 320) ? 2 : 1;
     int scale_y = (height <= 256) ? 2 : 1;
+    if (width <= 320 && height <= 256) {
+        int fit_x = (int)fb->xres / width;
+        int fit_y = (int)fb->yres / height;
+        int fit = fit_x < fit_y ? fit_x : fit_y;
+        if (fit > 2) {
+            scale_x = scale_y = fit;
+        }
+    }
 
     int dst_w = width * scale_x;
     int dst_h = height * scale_y;
@@ -146,9 +154,40 @@ int Fbdev_Present(FbdevPresent *fb, const uint32_t *pixels, int stride, int widt
         copy_h = (int)fb->yres / scale_y;
     }
 
+    if (width != fbdev_cleared_w || height != fbdev_cleared_h) {
+        memset(fb->pixels, 0, (size_t)fb->line_length * fb->yres);
+        fbdev_cleared_w = width;
+        fbdev_cleared_h = height;
+    }
+
     int is_argb = (fb->red_offset == 16 && fb->red_length == 8 &&
                    fb->green_offset == 8 && fb->green_length == 8 &&
                    fb->blue_offset == 0 && fb->blue_length == 8);
+
+    if (scale_x > 2 || scale_y > 2) {
+        for (int y = 0; y < copy_h; y++) {
+            const uint32_t *src_row = pixels + (src_y_off + y) * stride + src_x_off;
+            for (int sy = 0; sy < scale_y; sy++) {
+                uint32_t *dst_row = (uint32_t *)(fb->pixels + (dst_y + y * scale_y + sy) * fb->line_length) + dst_x;
+                for (int x = 0; x < copy_w; x++) {
+                    uint32_t p;
+                    if (is_argb) {
+                        p = src_row[x] & 0x00ffffff;
+                    } else {
+                        uint32_t c = src_row[x];
+                        uint8_t r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+                        p = (((r * ((1u << fb->red_length) - 1) + 127) / 255) << fb->red_offset) |
+                            (((g * ((1u << fb->green_length) - 1) + 127) / 255) << fb->green_offset) |
+                            (((b * ((1u << fb->blue_length) - 1) + 127) / 255) << fb->blue_offset);
+                    }
+                    for (int sx = 0; sx < scale_x; sx++) {
+                        dst_row[x * scale_x + sx] = p;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
 
     for (int y = 0; y < copy_h; y++) {
         const uint32_t *src_row = pixels + (src_y_off + y) * stride + src_x_off;
