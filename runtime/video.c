@@ -46,6 +46,7 @@
 #include "port_harness.h"
 #include "port_runtime.h"
 #include "psyq.h"
+#include "psyq_internal.h"
 
 #ifdef PSXSTACK_SDL
 #include <SDL3/SDL.h>
@@ -906,6 +907,18 @@ void port_video_widescreen(int on) {
         video_wide_logged = 1;
         port_log("widescreen: needs the GPU renderer (video.renderer gpu); the picture stays 4:3");
     }
+}
+
+int port_video_widescreen_pad(void) {
+#ifdef PSXSTACK_SDL
+    return render_gpu_wide_pad();
+#else
+    return 0;
+#endif
+}
+
+void port_video_vram_extend(void) {
+    gpu_vram_extend();
 }
 
 /* The present cap (fast-forward): at most `hz` presents a second (0: every vsync). Every vsync is still drawn into

@@ -111,6 +111,10 @@ unfiltered (docs/PORT.md "Rendering").
 `port_video_widescreen(1)` (every vsync of the scenes that widen), the hardware renderer presents those scenes 16:9
 inside the window, the rest 4:3; the window opens 16:9 when the mod is on and `video.renderer` is `gpu`. With the
 software renderer the picture stays 4:3 and the run logs `widescreen: needs the GPU renderer` once.
+`port_video_widescreen_pad()` is the canvas's columns past each side of the display as of the last vsync (53 for a
+320-wide display at 16:9, 0 while the picture is 4:3), for a game whose 2D can draw that far; `port_video_vram_extend()`
+(from a mod's start) makes the VRAM 1024x1024 for the extra textures (`psyq/gpu.c` "The extension"); a save state then
+holds the extra rows (`gpu_vram_ext`), and a state without them does not load.
 `<PREFIX>_PORT_PRESENT_READBACK=FRAME:PATH` reads SDL_Renderer's output back (a game's renderer test compares the two
 present paths). `<PREFIX>_PORT_GPU_VRAM_CHECK=N` compares the rasteriser's whole target with the software VRAM every N
 vsyncs and logs any difference (with `--renderer gpu --window`, or `--gpu-screenshot` headless).

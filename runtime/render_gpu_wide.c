@@ -164,6 +164,11 @@ void render_gpu_wide_set(int on) {
     }
 }
 
+int render_gpu_wide_pad(void) {
+    PsyqDisplay d;
+    return wide.on && wide_display(&d) ? wide.pad : 0;
+}
+
 int render_gpu_wide_width(const int vram_xy[2], int w, int h) {
     PsyqDisplay d;
     WideSlot *s;
@@ -308,7 +313,7 @@ void render_gpu_wide_event(const GpuEvent *ev) {
         break;
     case GPU_EV_COPY:
     case GPU_EV_LOAD:
-        wide_mirror(ev->x & 1023, ev->y & 511, ev->w, ev->h);
+        wide_mirror(ev->x & 1023, ev->y & (gpu_vram_rows() - 1), ev->w, ev->h);
         break;
     case GPU_EV_POWER_ON:
         memset(wide.slot, 0, sizeof(wide.slot));

@@ -88,9 +88,19 @@ void port_fast_forward_request(int on);
 /* video.c: widescreen (GAME_CONTRACT.md "4. The adapter units", the mods; render_gpu_wide.c). A game mod that widens
  * some scenes calls port_video_widescreen_enable from its start (before the window opens: with the GPU renderer a new
  * window opens 16:9 and the rasteriser keeps a wide canvas) and port_video_widescreen every vsync: on while the
- * scene's 3D reaches past the display's edges, off elsewhere. The software renderer stays 4:3 (logged once). */
+ * scene's 3D reaches past the display's edges, off elsewhere. The software renderer stays 4:3 (logged once).
+ * port_video_widescreen_pad: the columns the picture shows past each side of the display (P: 53 for a 320-wide display
+ * at 16:9, 32 at 16:10), as of the last vsync; 0 while the picture is 4:3 (off, the software renderer, a 4:3 window).
+ * A game whose 2D can draw past the display's edges (the canvas shows what lies there: render_gpu_wide.c) draws that
+ * far while it is non-zero.
+ * port_video_vram_extend: the VRAM grows to 1024x1024 (psyq/gpu.c "The extension": Psy-Q's 2 MB VRAM layout), more
+ * texture room for a game that draws more than its PS1 VRAM held (rows 512-1023: textures and CLUTs only, through
+ * getTPage's and getClut's y bit 9). Called from a mod's start; it stays for the run, and a save state of the run has
+ * the extra rows (one without them does not load). */
 void port_video_widescreen_enable(void);
 void port_video_widescreen(int on);
+int port_video_widescreen_pad(void);
+void port_video_vram_extend(void);
 long port_pace_get(void);
 int port_video_available(void);
 int port_video_screenshot_add(const char *spec); /* "FRAME:PATH"; 0 when malformed (or too many) */

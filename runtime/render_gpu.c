@@ -16,7 +16,9 @@
  * (no fixed-function blending: DECISIONS "The hardware renderer"). Two copies keep the stream's order:
  *  - the software VRAM's copy (R16_UINT, the texels and CLUTs): before a unit samples a block that gpu.c wrote since
  *    the last upload (gpu.c's write stamps), the block is copied now and uploaded at that point of the frame; so is a
- *    transfer's rectangle before the transfer is drawn;
+ *    transfer's rectangle before the transfer is drawn. It has 1024 rows: an extended VRAM's rows 512-1023 (gpu.c
+ *    "The extension") hold only textures and CLUTs, so they are in the copy and not in the target (a transfer, fill
+ *    or copy there is drawn only where it reaches the target's rows);
  *  - the background (a copy of the target): before a unit that reads the background (semi-transparent, mask-checked;
  *    a VRAM copy), the 16x16 tiles of its rectangle that something drew into since their last copy are copied. A unit
  *    is one triangle or one line segment (a quad's two triangles may overlap, a polyline's segments share a pixel).
@@ -58,7 +60,8 @@
 #define RENDER_IMAGE_W 640 /* video.c's VIDEO_MAX_W, VIDEO_MAX_H: the largest display image */
 #define RENDER_IMAGE_H 576
 #define VRAM_W 1024
-#define VRAM_H 512
+#define VRAM_H 512 /* the target's rows (the drawing area's) */
+#define MIRROR_H 1024 /* the VRAM copy's: gpu.c's VRAM, extended or not (gpu_vram_rows) */
 #define TILE 16 /* the background's dirty tiles */
 #define TILES_X ((VRAM_W + RENDER_WIDE_COLS) / TILE) /* the target's widest: the VRAM and the wide canvas strip */
 #define TILES_Y (VRAM_H / TILE)
@@ -137,7 +140,7 @@ static struct {
     SDL_GPUGraphicsPipeline *pipe_raster;
     SDL_GPUTexture *vram_target;           /* RGBA8 1024 scale x 512 scale: the rasteriser's VRAM */
     SDL_GPUTexture *background;            /* its copy, what units read */
-    SDL_GPUTexture *mirror;                /* R16_UINT 1024x512: the software VRAM's copy */
+    SDL_GPUTexture *mirror;                /* R16_UINT 1024x1024: the software VRAM's copy */
     SDL_GPUTransferBuffer *staging_buf;    /* the frame's uploads */
     Uint32 staging_buf_size;
     SDL_GPUTransferBuffer *vram_download;  /* render_gpu_read_vram */
@@ -145,7 +148,7 @@ static struct {
     size_t nrecs, caprecs;
     u8 *staging;                           /* the frame's upload pixels */
     size_t nstaging, capstaging;
-    u32 uploaded[VRAM_H][BLOCKS];          /* the stamp each block had at its last upload; STAMP_NONE: never */
+    u32 uploaded[MIRROR_H][BLOCKS];        /* the stamp each block had at its last upload; STAMP_NONE: never */
     u32 generation;                        /* gpu.c's stamp generation at the last check */
     u8 dirty[TILES_Y][TILES_X];            /* drawn into since the tile's last background copy */
     SDL_GPUFence *inflight[RENDER_INFLIGHT]; /* the last frames' fences: at most RENDER_INFLIGHT frames queued */
@@ -198,7 +201,7 @@ static void sync_vram(int x0, int y0, int w, int h) {
     const u32 *stamps = gpu_block_stamps();
     const u16 *vram = gpu_vram_pixels();
     unsigned need = 0;
-    int j;
+    int j, rows = gpu_vram_rows();
     Record *run = NULL;
     u32 now;
 
@@ -219,8 +222,8 @@ static void sync_vram(int x0, int y0, int w, int h) {
         need |= 1u << (((x0 + w - 1) & 1023) >> 6);
     }
     now = gpu_stamp_bump(); /* the blocks' stamps are at most `now`; later writes carry newer ones */
-    for (j = 0; j < (h < VRAM_H ? h : VRAM_H); j++) {
-        int y = (y0 + j) & 511, b, lo = -1, hi = -1;
+    for (j = 0; j < (h < rows ? h : rows); j++) {
+        int y = (y0 + j) & (rows - 1), b, lo = -1, hi = -1;
         for (b = 0; b < BLOCKS; b++) {
             if ((need >> b & 1) && (r.uploaded[y][b] == STAMP_NONE || stamps[y * BLOCKS + b] > r.uploaded[y][b])) {
                 lo = lo < 0 ? b : lo;
@@ -593,28 +596,32 @@ static void raster_segment(const GpuEvent *ev) {
 }
 
 /* A rectangle at (x, y) wrapping at the VRAM's edges, as up to four rectangles inside it: each piece's corner and size
- * in piece[k][0..3], the piece's offset from (x, y) in piece[k][4..5]. */
+ * in piece[k][0..3], the piece's offset from (x, y) in piece[k][4..5]. An extended VRAM's rows past the target's are
+ * left out (they have no pixels in the target). */
 static int split_wrap(int x, int y, int w, int h, int piece[4][6]) {
-    int n = 0, i, j;
+    int n = 0, i, j, rows = gpu_vram_rows();
     int xs[2][3], ys[2][3], nx = 0, ny = 0;
     x &= 1023;
-    y &= 511;
+    y &= rows - 1;
     w = SDL_min(w, VRAM_W);
-    h = SDL_min(h, VRAM_H);
+    h = SDL_min(h, rows);
     xs[nx][0] = x, xs[nx][1] = SDL_min(w, VRAM_W - x), xs[nx++][2] = 0;
     if (x + w > VRAM_W) {
         xs[nx][0] = 0, xs[nx][1] = x + w - VRAM_W, xs[nx++][2] = VRAM_W - x;
     }
-    ys[ny][0] = y, ys[ny][1] = SDL_min(h, VRAM_H - y), ys[ny++][2] = 0;
-    if (y + h > VRAM_H) {
-        ys[ny][0] = 0, ys[ny][1] = y + h - VRAM_H, ys[ny++][2] = VRAM_H - y;
+    ys[ny][0] = y, ys[ny][1] = SDL_min(h, rows - y), ys[ny++][2] = 0;
+    if (y + h > rows) {
+        ys[ny][0] = 0, ys[ny][1] = y + h - rows, ys[ny++][2] = rows - y;
     }
     for (j = 0; j < ny; j++) {
+        if (ys[j][0] >= VRAM_H) {
+            continue;
+        }
         for (i = 0; i < nx; i++) {
             piece[n][0] = xs[i][0];
             piece[n][1] = ys[j][0];
             piece[n][2] = xs[i][1];
-            piece[n][3] = ys[j][1];
+            piece[n][3] = SDL_min(ys[j][1], VRAM_H - ys[j][0]);
             piece[n][4] = xs[i][2];
             piece[n][5] = ys[j][2];
             n++;
@@ -684,6 +691,12 @@ static void raster_copy(const GpuEvent *ev) {
     int xs[4], ys[4], nx, ny, i, j;
     int ddx = ((ev->sx - ev->x + 512) & 1023) - 512, ddy = ((ev->sy - ev->y + 256) & 511) - 256;
     RasterUnit u;
+    /* A copy from or into an extended VRAM's rows past the target's: the destination's rows in the target from the
+     * VRAM (the source may have no pixels in the target). */
+    if (gpu_vram_rows() > VRAM_H && (ev->sy + ev->h > VRAM_H || ev->y + ev->h > VRAM_H)) {
+        raster_load(ev->x, ev->y, ev->w, ev->h, 0);
+        return;
+    }
     /* gpu.c copies pixel by pixel, rows from the top, each from the left, reading the VRAM as it writes: a copy whose
      * destination overlaps its source further on re-reads pixels it wrote (it smears). The event comes after the copy:
      * such a copy's destination is then taken from the VRAM, as a transfer is. */
@@ -1019,7 +1032,7 @@ int render_gpu_raster_start(int scale, char *why, size_t why_size) {
         return 0;
     }
     r.pipe_raster = render_pipeline(r.raster_vert, r.raster_frag, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM);
-    r.mirror = render_texture(SDL_GPU_TEXTUREFORMAT_R16_UINT, VRAM_W, VRAM_H, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    r.mirror = render_texture(SDL_GPU_TEXTUREFORMAT_R16_UINT, VRAM_W, MIRROR_H, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     r.no_replacement = render_texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
     {
         SDL_GPUSamplerCreateInfo si;

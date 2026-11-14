@@ -147,6 +147,17 @@ and the software picture do not change; the VRAM part stays exact. Rejected: squ
 changes what the game draws and stretches every 2D sprite). The game names the scenes (`port_video_widescreen`); a
 scene whose 2D ends at the screen's edge stays 4:3. The first game's issue #71 has the measurements.
 
+## More texture room: Psy-Q's 2 MB VRAM layout, textures only (2026-10-26)
+A game that draws more than its PS1 screen held needs textures the 1 MB VRAM has no room for (the first game's field:
+3 more 128x128 map tiles for a 16:9 picture, the first game's issue #78). `port_video_vram_extend` makes `gpu.c`'s
+VRAM 1024x1024 in Psy-Q's 2 MB layout: its `getTPage` already puts y's bit 9 into the texture page's bit 11 and
+`getClut` into the CLUT's bit 15, so the game's code reaches rows 512-1023 with its own macros, and the 1 MB GPU (every
+build that does not ask) ignores both bits as before. Only textures and CLUTs live there: the drawing
+area and the display stay in rows 0-511 (E3/E4 have 9 bits of y), so the hardware renderer's target keeps its size and
+only its VRAM copy, which every texel comes from, grows. Rejected: a second texture memory behind a port-only command
+(a new primitive tag, another sampler, the same cost for nothing more), and room found in the game's own VRAM (what a
+stage overlay loads varies by map, so every map would have to be measured, and a later change could take it).
+
 ## Texture keys by content, SHA-1, per VRAM word (2026-10-08)
 Texture replacement (docs/PORT.md "Texture replacement") names a texture by the transfer that loaded it and by its
 CLUT's content, never by VRAM position: the first game loads one image at up to 11 places and reuses places for
