@@ -55,8 +55,10 @@
 #include "render_gpu_textures.h"
 #elif defined(PSXSTACK_SDL2)
 #include <SDL2/SDL.h>
+#ifndef __ANDROID__
 #include <unistd.h>
 #include "fbdev_present.h"
+#endif
 #ifdef PSXSTACK_EGL
 #include "render_gles.h"
 #endif
@@ -660,7 +662,9 @@ static SDL_Texture *video_texture;
 static int video_tex_w, video_tex_h;
 static Uint32 video_start_ms;
 static long video_presents;
+#ifndef __ANDROID__
 static FbdevPresent fbdev;
+#endif
 static int fbdev_active;
 #ifdef PSXSTACK_EGL
 static long video_gles_check_every; /* DW3_GLES_CHECK: frames between VRAM comparisons, 0 off */
@@ -709,6 +713,7 @@ static void video_init_gles_if_wanted(void) {
 
 void port_video_open(int scale, int fullscreen) {
     (void)scale;
+#ifndef __ANDROID__
     const char *video_env = getenv("DW3_VIDEO");
     int want_fbdev = (video_env && strcmp(video_env, "fbdev") == 0);
     if (!video_env && !getenv("SDL_VIDEODRIVER")) {
@@ -730,6 +735,7 @@ void port_video_open(int scale, int fullscreen) {
             port_log("video: fbdev open failed (%s); falling back to SDL2", why);
         }
     }
+#endif
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) < 0) {
         port_log("video: SDL full init failed (%s); retrying video-only", SDL_GetError());
@@ -771,12 +777,18 @@ void port_video_toggle_fullscreen(void) {
     }
 }
 
+__attribute__((weak)) void port_touch_draw(void *sdl_renderer) {
+    (void)sdl_renderer;
+}
+
 static void video_present(void) {
+#ifndef __ANDROID__
     if (fbdev_active) {
         Fbdev_Present(&fbdev, video_pixels, video_w, video_w, video_h);
         video_presents++;
         return;
     }
+#endif
     if (video_renderer != NULL) {
         if (video_texture == NULL || video_tex_w != video_w || video_tex_h != video_h) {
             if (video_texture != NULL) {
@@ -794,6 +806,9 @@ static void video_present(void) {
         SDL_SetRenderDrawColor(video_renderer, 0, 0, 0, 255);
         SDL_RenderClear(video_renderer);
         SDL_RenderCopy(video_renderer, video_texture, NULL, NULL);
+        SDL_RenderSetLogicalSize(video_renderer, 0, 0);
+        port_touch_draw(video_renderer);
+        SDL_RenderSetLogicalSize(video_renderer, 640, 480);
         SDL_RenderPresent(video_renderer);
         video_presents++;
     }
@@ -832,10 +847,12 @@ void port_video_quit(void) {
         video_gles = 0;
     }
 #endif
+#ifndef __ANDROID__
     if (fbdev_active) {
         Fbdev_Close(&fbdev);
         fbdev_active = 0;
     }
+#endif
     if (video_texture != NULL) {
         SDL_DestroyTexture(video_texture);
         video_texture = NULL;
@@ -1030,7 +1047,7 @@ static void video_present_stat(long long t0, int direct, int bits, int w, int h)
     sec0 = now;
 }
 
-#if defined(PSXSTACK_SDL2)
+#if defined(PSXSTACK_SDL2) && !defined(__ANDROID__)
 /* Skips the scalar expand when the framebuffer can take the VRAM rectangle directly. 1 if it drew. */
 static int video_present_direct(long long *t0) {
     PsyqDisplay d;
@@ -1177,7 +1194,7 @@ void port_video_frame(void) {
     if (!present && !shot) {
         return;
     }
-#if defined(PSXSTACK_SDL2)
+#if defined(PSXSTACK_SDL2) && !defined(__ANDROID__)
     if (present && !shot && video_present_direct(&present_t0)) {
         return;
     }

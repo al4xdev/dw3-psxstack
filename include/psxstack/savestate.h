@@ -60,15 +60,25 @@ void port_savestate_load_request(void) __attribute__((noreturn));
 void port_debug_state_point(void);
 
 /* The capture point (pump.c, at the end of every vsync, armed only): __builtin_setjmp keeps the context in this
- * function's frame (it must stay live: hence a macro, not a call); a load's __builtin_longjmp returns here with 1. */
-extern int port_savestate_armed;
+ * function's frame (it must stay live: hence a macro, not a call); a load's __builtin_longjmp returns here with 1.
+ * Clang's AArch64 backend lacks __builtin_setjmp/longjmp, so fall back to <setjmp.h> there (unmangled on Bionic). */
+#if defined(__clang__) && defined(__aarch64__)
+#include <setjmp.h>
+extern jmp_buf port_savestate_ctx;
+#define PORT_SAVESTATE_SETJMP() setjmp(port_savestate_ctx)
+#define PORT_SAVESTATE_LONGJMP() longjmp(port_savestate_ctx, 1)
+#else
 extern void *port_savestate_ctx[5];
+#define PORT_SAVESTATE_SETJMP() __builtin_setjmp(port_savestate_ctx)
+#define PORT_SAVESTATE_LONGJMP() __builtin_longjmp(port_savestate_ctx, 1)
+#endif
+extern int port_savestate_armed;
 void port_savestate_captured(void);
 void port_savestate_resumed(void);
 #define PORT_SAVESTATE_POINT()                                                                                         \
     do {                                                                                                               \
         if (port_savestate_armed) {                                                                                    \
-            if (__builtin_setjmp(port_savestate_ctx) == 0) {                                                           \
+            if (PORT_SAVESTATE_SETJMP() == 0) {                                                                        \
                 port_savestate_captured();                                                                             \
             } else {                                                                                                   \
                 port_savestate_resumed();                                                                              \

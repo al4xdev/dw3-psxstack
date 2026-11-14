@@ -91,7 +91,11 @@ struct PortState {
 
 static u8 state_stack[STATE_STACK_SIZE] __attribute__((aligned(64)));
 int port_savestate_armed;          /* the game runs on state_stack; port_frame keeps its context */
+#if defined(__clang__) && defined(__aarch64__)
+jmp_buf port_savestate_ctx;
+#else
 void *port_savestate_ctx[5];       /* __builtin_setjmp's buffer at the last vsync's end (pump.c) */
+#endif
 /* The stack the context is on: the game stack, or the fiber's the vsync ended on (fiber.c): a state resumes that one. */
 static u8 *state_cur_base;         /* that stack's lowest byte and its size, at the last capture */
 static size_t state_cur_size;
@@ -630,7 +634,7 @@ void port_savestate_run(int jumped) {
 #endif
         port_fiber_enter_current(); /* Windows: the thread block's bounds for a fiber's stack */
         state_set_canary(h.canary);
-        __builtin_longjmp(port_savestate_ctx, 1);
+        PORT_SAVESTATE_LONGJMP();
     }
     if (!port_savestate_armed) {
         game_main();

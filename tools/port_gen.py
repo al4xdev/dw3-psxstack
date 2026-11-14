@@ -338,11 +338,27 @@ def is_game_section(game_id, name):
 
 
 def object_sections(objdump, obj):
-    """('elf' | 'pe', [(section name, size, flags)]) of an object, from `objdump -h` (GNU binutils, which reads both)."""
+    """('elf' | 'pe', [(section name, size, flags)]) of an object, from GNU objdump -h or llvm-objdump -h."""
     r = subprocess.run([objdump, "-h", obj], capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"port_gen: {objdump} -h {obj}: {r.stderr.strip()}")
-    fmt, rows, name, size = None, [], None, 0
+    fmt, rows, name, size, llvm_type = None, [], None, 0, ""
+
+    def flush_llvm():
+        nonlocal name
+        if name is None:
+            return
+        if llvm_type == "TEXT":
+            flags = {"ALLOC", "CODE"}
+        elif llvm_type == "BSS":
+            flags = {"ALLOC"}
+        elif llvm_type == "DATA":
+            flags = {"ALLOC", "READONLY"} if name.startswith((".rodata", ".eh_frame")) else {"ALLOC"}
+        else:
+            flags = set()
+        rows.append((name, size, flags))
+        name = None
+
     for ln in r.stdout.splitlines():
         m = re.search(r"file format (\S+)", ln)
         if m:
@@ -350,10 +366,13 @@ def object_sections(objdump, obj):
             continue
         p = ln.split()
         if len(p) >= 3 and p[0].isdigit() and not ln.startswith(" " * 10):
+            flush_llvm()
             name, size = p[1], int(p[2], 16)
+            llvm_type = p[4] if len(p) >= 5 else ""
         elif name is not None and ln.startswith(" " * 10):
             rows.append((name, size, set(f.strip() for f in ln.split(","))))
             name = None
+    flush_llvm()
     if fmt is None:
         sys.exit(f"port_gen: {objdump} -h {obj}: no file format line")
     return fmt, rows
@@ -553,6 +572,13 @@ def cmd_tables(args):
         out += [f"    {{ 0x{a:08X}u, (PortFn){s} }}," for a, s in rows]
         out += ["    { 0, NULL },", "};"]
     out.append("")
+    if tables:
+        out += ["#if defined(__ELF__) && defined(__clang__)", "__asm__("]
+        for o, _ in tables:
+            sn = section_name(o["name"])
+            out.append(f'    ".section {args.id}_data_{sn},\\"aw\\",@progbits\\n"')
+            out.append(f'    ".section {args.id}_bss_{sn},\\"aw\\",@nobits\\n"')
+        out += [");", "#endif", ""]
     for o, _ in tables:
         syms = [bracket_symbol(args.id, o["name"], k, w) for k in ("data", "bss") for w in ("start", "stop")]
         out.append("extern char " + ", ".join(f"{s}[]" for s in syms) + ";")

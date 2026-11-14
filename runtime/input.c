@@ -824,9 +824,67 @@ void port_input_poll_paused(void) {
 #elif defined(PSXSTACK_SDL2)
 #include <SDL2/SDL.h>
 
-static SDL_GameController *input_controller;
+#define MAX_SDL2_PADS 4
+static SDL_GameController *input_controllers[MAX_SDL2_PADS];
+static SDL_Joystick *input_joysticks[MAX_SDL2_PADS];
+static SDL_JoystickID input_pad_ids[MAX_SDL2_PADS];
+static u16 input_touch_bits;
 static u16 input_applied;
 static int input_applied_any;
+
+void port_input_set_touch_bits(u16 bits) {
+    input_touch_bits = bits;
+}
+
+__attribute__((weak)) void port_touch_event(const void *sdl_event) {
+    (void)sdl_event;
+}
+
+static void sdl2_open_device(int dev_index) {
+    SDL_JoystickID jid = SDL_JoystickGetDeviceInstanceID(dev_index);
+    for (int i = 0; i < MAX_SDL2_PADS; i++) {
+        if ((input_controllers[i] != NULL || input_joysticks[i] != NULL) && input_pad_ids[i] == jid) {
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_SDL2_PADS; i++) {
+        if (input_controllers[i] == NULL && input_joysticks[i] == NULL) {
+            if (SDL_IsGameController(dev_index)) {
+                SDL_GameController *gc = SDL_GameControllerOpen(dev_index);
+                if (gc != NULL) {
+                    input_controllers[i] = gc;
+                    input_pad_ids[i] = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc));
+                    port_log("input: opened game controller '%s'", SDL_GameControllerName(gc));
+                    return;
+                }
+            }
+            SDL_Joystick *js = SDL_JoystickOpen(dev_index);
+            if (js != NULL) {
+                input_joysticks[i] = js;
+                input_pad_ids[i] = SDL_JoystickInstanceID(js);
+                port_log("input: opened joystick '%s'", SDL_JoystickName(js));
+            }
+            return;
+        }
+    }
+}
+
+static void sdl2_close_instance(SDL_JoystickID jid) {
+    for (int i = 0; i < MAX_SDL2_PADS; i++) {
+        if ((input_controllers[i] != NULL || input_joysticks[i] != NULL) && input_pad_ids[i] == jid) {
+            if (input_controllers[i] != NULL) {
+                SDL_GameControllerClose(input_controllers[i]);
+                input_controllers[i] = NULL;
+            }
+            if (input_joysticks[i] != NULL) {
+                SDL_JoystickClose(input_joysticks[i]);
+                input_joysticks[i] = NULL;
+            }
+            input_pad_ids[i] = 0;
+            port_log("input: removed controller");
+        }
+    }
+}
 
 void port_input_init(int test) {
     input_test = test;
@@ -835,18 +893,12 @@ void port_input_init(int test) {
         return;
     }
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
-        if (SDL_IsGameController(i)) {
-            input_controller = SDL_GameControllerOpen(i);
-            if (input_controller != NULL) {
-                port_log("input: opened game controller '%s'", SDL_GameControllerName(input_controller));
-                break;
-            }
-        }
+        sdl2_open_device(i);
     }
 }
 
 static u16 input_read_buttons(void) {
-    u16 bits = 0;
+    u16 bits = input_touch_bits;
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
 
     if (keys != NULL) {
@@ -866,51 +918,80 @@ static u16 input_read_buttons(void) {
         if (keys[SDL_SCANCODE_2]) bits |= PAD_R2;
     }
 
-    if (input_controller != NULL) {
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_UP)) bits |= PAD_UP;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) bits |= PAD_DOWN;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) bits |= PAD_LEFT;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) bits |= PAD_RIGHT;
+    int any_l3_r3 = 0;
+    for (int i = 0; i < MAX_SDL2_PADS; i++) {
+        SDL_GameController *gc = input_controllers[i];
+        if (gc != NULL) {
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP)) bits |= PAD_UP;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) bits |= PAD_DOWN;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) bits |= PAD_LEFT;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) bits |= PAD_RIGHT;
 
-        Sint16 lx = SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_LEFTX);
-        Sint16 ly = SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_LEFTY);
-        if (lx < -12000) bits |= PAD_LEFT;
-        if (lx > 12000) bits |= PAD_RIGHT;
-        if (ly < -12000) bits |= PAD_UP;
-        if (ly > 12000) bits |= PAD_DOWN;
+            Sint16 lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
+            Sint16 ly = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
+            if (lx < -12000) bits |= PAD_LEFT;
+            if (lx > 12000) bits |= PAD_RIGHT;
+            if (ly < -12000) bits |= PAD_UP;
+            if (ly > 12000) bits |= PAD_DOWN;
 
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_A)) bits |= PAD_CROSS;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_B)) bits |= PAD_CIRCLE;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_X)) bits |= PAD_SQUARE;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_Y)) bits |= PAD_TRIANGLE;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A)) bits |= PAD_CROSS;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B)) bits |= PAD_CIRCLE;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X)) bits |= PAD_SQUARE;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y)) bits |= PAD_TRIANGLE;
 
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_BACK)) bits |= PAD_SELECT;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_START)) bits |= PAD_START;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) bits |= PAD_L1;
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) bits |= PAD_R1;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK)) bits |= PAD_SELECT;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START)) bits |= PAD_START;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) bits |= PAD_L1;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) bits |= PAD_R1;
 
-        if (SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) bits |= PAD_L2;
-        if (SDL_GameControllerGetAxis(input_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) bits |= PAD_R2;
+            if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) bits |= PAD_L2;
+            if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) bits |= PAD_R2;
 
-        if (SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_BACK) &&
-            SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_START)) {
-            port_exit(0, "Quit hotkey Select+Start pressed");
-        }
-
-        static int l3_r3_was_down;
-        int l3 = SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_LEFTSTICK);
-        int r3 = SDL_GameControllerGetButton(input_controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
-        if (l3 && r3) {
-            if (!l3_r3_was_down) {
-                l3_r3_was_down = 1;
-                static int ff_active = 0;
-                ff_active = !ff_active;
-                port_fast_forward_request(ff_active);
-                port_log("handheld: hotkey L3+R3: fast-forward %s", ff_active ? "ON" : "OFF");
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK) &&
+                SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START)) {
+                port_exit(0, "Quit hotkey Select+Start pressed");
             }
-        } else {
-            l3_r3_was_down = 0;
+            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
+                SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) {
+                any_l3_r3 = 1;
+            }
+            continue;
         }
+        SDL_Joystick *js = input_joysticks[i];
+        if (js != NULL) {
+            Uint8 hat = SDL_JoystickGetHat(js, 0);
+            if (hat & SDL_HAT_UP) bits |= PAD_UP;
+            if (hat & SDL_HAT_DOWN) bits |= PAD_DOWN;
+            if (hat & SDL_HAT_LEFT) bits |= PAD_LEFT;
+            if (hat & SDL_HAT_RIGHT) bits |= PAD_RIGHT;
+            Sint16 lx = SDL_JoystickGetAxis(js, 0);
+            Sint16 ly = SDL_JoystickGetAxis(js, 1);
+            if (lx < -12000) bits |= PAD_LEFT;
+            if (lx > 12000) bits |= PAD_RIGHT;
+            if (ly < -12000) bits |= PAD_UP;
+            if (ly > 12000) bits |= PAD_DOWN;
+            if (SDL_JoystickGetButton(js, 0)) bits |= PAD_CROSS;
+            if (SDL_JoystickGetButton(js, 1)) bits |= PAD_CIRCLE;
+            if (SDL_JoystickGetButton(js, 2)) bits |= PAD_SQUARE;
+            if (SDL_JoystickGetButton(js, 3)) bits |= PAD_TRIANGLE;
+            if (SDL_JoystickGetButton(js, 4)) bits |= PAD_L1;
+            if (SDL_JoystickGetButton(js, 5)) bits |= PAD_R1;
+            if (SDL_JoystickGetButton(js, 6)) bits |= PAD_SELECT;
+            if (SDL_JoystickGetButton(js, 7)) bits |= PAD_START;
+        }
+    }
+
+    static int l3_r3_was_down;
+    if (any_l3_r3) {
+        if (!l3_r3_was_down) {
+            l3_r3_was_down = 1;
+            static int ff_active = 0;
+            ff_active = !ff_active;
+            port_fast_forward_request(ff_active);
+            port_log("handheld: hotkey L3+R3: fast-forward %s", ff_active ? "ON" : "OFF");
+        }
+    } else {
+        l3_r3_was_down = 0;
     }
     return bits;
 }
@@ -926,19 +1007,17 @@ static void input_poll(void) {
             }
             break;
         case SDL_CONTROLLERDEVICEADDED:
-            if (input_controller == NULL) {
-                input_controller = SDL_GameControllerOpen(e.cdevice.which);
-                if (input_controller != NULL) {
-                    port_log("input: attached game controller '%s'", SDL_GameControllerName(input_controller));
-                }
-            }
+        case SDL_JOYDEVICEADDED:
+            sdl2_open_device(e.cdevice.which);
             break;
         case SDL_CONTROLLERDEVICEREMOVED:
-            if (input_controller != NULL) {
-                SDL_GameControllerClose(input_controller);
-                input_controller = NULL;
-                port_log("input: removed game controller");
-            }
+        case SDL_JOYDEVICEREMOVED:
+            sdl2_close_instance(e.cdevice.which);
+            break;
+        case SDL_FINGERDOWN:
+        case SDL_FINGERMOTION:
+        case SDL_FINGERUP:
+            port_touch_event(&e);
             break;
         default:
             break;

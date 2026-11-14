@@ -31,7 +31,11 @@
  * the PDB. */
 #ifndef _WIN32
 #define _GNU_SOURCE
+#ifdef __ANDROID__
+#include <unwind.h>
+#else
 #include <execinfo.h>
+#endif
 #include <link.h>
 #include <signal.h>
 #include <sys/utsname.h>
@@ -265,10 +269,31 @@ static void crash_write_frames(void *const *frames, int n, const char *what) {
     }
 }
 
+#ifdef __ANDROID__
+struct android_unwind_state {
+    void **frames;
+    int count;
+    int max;
+};
+
+static _Unwind_Reason_Code android_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
+    struct android_unwind_state *st = arg;
+    uintptr_t pc = _Unwind_GetIP(ctx);
+    if (pc != 0 && st->count < st->max) {
+        st->frames[st->count++] = (void *)pc;
+    }
+    return st->count < st->max ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+#endif
+
 static void crash_write_stack(void) {
     void *frames[CRASH_FRAMES];
 #ifdef _WIN32
     int n = (int)CaptureStackBackTrace(0, CRASH_FRAMES, frames, NULL);
+#elif defined(__ANDROID__)
+    struct android_unwind_state st = { frames, 0, CRASH_FRAMES };
+    _Unwind_Backtrace(android_unwind_cb, &st);
+    int n = st.count;
 #else
     int n = backtrace(frames, CRASH_FRAMES);
 #endif
@@ -444,14 +469,18 @@ static void crash_init_platform(void) {
     crash_exe_hi = crash_exe_base + nt->OptionalHeader.SizeOfImage;
 #else
     struct utsname u;
-    void *frames[4];
     if (uname(&u) == 0) {
         snprintf(crash_platform, sizeof(crash_platform), "%s %s %s", u.sysname, u.release, u.machine);
     } else {
         strcpy(crash_platform, "unknown");
     }
     dl_iterate_phdr(crash_phdr, NULL);
-    backtrace(frames, 4); /* primes libgcc's unwinder: the handler's call then loads nothing */
+#ifndef __ANDROID__
+    {
+        void *frames[4];
+        backtrace(frames, 4); /* primes libgcc's unwinder: the handler's call then loads nothing */
+    }
+#endif
 #endif
 }
 
