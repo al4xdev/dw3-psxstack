@@ -214,7 +214,9 @@ static void status_emit(const char *tag) {
         char buf[64];
         int n = snprintf(buf, sizeof(buf), "%s\n", tag);
         if (n > 0) {
-            (void)write(fd, buf, (size_t)n);
+            if (write(fd, buf, (size_t)n) < 0) {
+                /* status pipe is best-effort */
+            }
         }
     }
 }
