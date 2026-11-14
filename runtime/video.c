@@ -84,6 +84,9 @@ static int video_gles;                  /* the offscreen GLES renderer draws; th
 #endif
 static int video_internal_scale = 1;    /* --internal-scale / video.internal_scale: the rasteriser's, 1..8 */
 static PortFilter video_filter;         /* --filter / video.filter: the hardware renderer's present (render_gpu_present.c) */
+#ifdef PSXSTACK_SDL
+static int video_fill;                  /* --fill / video.fill: fill output preserving aspect (0: integer scale) */
+#endif
 static struct {
     long frame;
     int w, h; /* the output's size; 0: the image's own */
@@ -244,6 +247,14 @@ void port_video_set_filter(const PortFilter *f) {
     video_filter = *f;
 }
 
+void port_video_set_fill(int fill) {
+#ifdef PSXSTACK_SDL
+    video_fill = fill;
+#else
+    (void)fill;
+#endif
+}
+
 int port_video_gpu_screenshot_add(const char *spec) {
     char *end;
     long frame = strtol(spec, &end, 0);
@@ -302,7 +313,8 @@ int port_video_available(void) {
 }
 
 void port_video_open(int scale, int fullscreen) {
-    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+    SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                            (fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         port_fatal("SDL_Init: %s (a host without a display: SDL_VIDEO_DRIVER=offscreen)", SDL_GetError());
     }
@@ -358,15 +370,25 @@ void port_video_toggle_fullscreen(void) {
 static void video_dest(int ow, int oh, SDL_FRect *dst) {
     int f = oh / video_h, an = video_aspect[0], ad = video_aspect[1];
     float dw, dh;
-    while (f > 0 && (video_h * f * an + ad - 1) / ad > ow) {
-        f--;
-    }
-    if (f > 0) {
-        dh = (float)(video_h * f);
-        dw = (float)((video_h * f * an + ad - 1) / ad); /* rounded up: 4:3's (h f 4 + 2) / 3 */
+    if (video_fill) {
+        if ((double)ow * ad <= (double)oh * an) {
+            dw = (float)ow;
+            dh = (float)((double)ow * ad / an);
+        } else {
+            dh = (float)oh;
+            dw = (float)((double)oh * an / ad);
+        }
     } else {
-        dh = (float)oh < ow * (float)ad / (float)an ? (float)oh : ow * (float)ad / (float)an;
-        dw = dh * (float)an / (float)ad;
+        while (f > 0 && (video_h * f * an + ad - 1) / ad > ow) {
+            f--;
+        }
+        if (f > 0) {
+            dh = (float)(video_h * f);
+            dw = (float)((video_h * f * an + ad - 1) / ad); /* rounded up: 4:3's (h f 4 + 2) / 3 */
+        } else {
+            dh = (float)oh < ow * (float)ad / (float)an ? (float)oh : ow * (float)ad / (float)an;
+            dw = dh * (float)an / (float)ad;
+        }
     }
     dst->w = dw;
     dst->h = dh;

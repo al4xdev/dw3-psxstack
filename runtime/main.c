@@ -233,6 +233,7 @@ int main(int argc, char **argv) {
     int window = 0, scale = 2, fullscreen = 0, input_test = 0, gpu = 0, gpu_shots = 0, internal_scale = 1;
     const char *renderer = "software";
     int subpixel = 1;
+    int fill = 0;
     const char *config = NULL;
     PortFilter filter = PORT_FILTER_DEFAULTS;
     int print_settings = 0, print_mods = 0, script_mods = 0;
@@ -251,6 +252,7 @@ int main(int argc, char **argv) {
         window = port_settings.window;
         scale = port_settings.scale;
         fullscreen = port_settings.fullscreen;
+        fill = port_settings.fill;
         /* The renderer the file asks for, as the default --renderer overrides below. It used to be read into `gpu`
          * alone, which only --print-settings ever looked at: a file saying "gpu" ran software. */
         renderer = port_settings.gles ? "gles" : port_settings.gpu ? "gpu" : "software";
@@ -387,6 +389,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "port: --filter: %s\n", err);
                 return 64;
             }
+        } else if (strcmp(argv[i], "--fill") == 0) {
+            fill = 1;
         } else if (strcmp(argv[i], "--gpu-screenshot") == 0 && i + 1 < argc) {
             if (!port_video_gpu_screenshot_add(argv[++i])) {
                 fprintf(stderr, "port: --gpu-screenshot: FRAME[@WxH]:PATH (FRAME >= 1; at most 64): %s\n", argv[i]);
@@ -449,6 +453,7 @@ int main(int argc, char **argv) {
         eff.window = window;
         eff.scale = scale;
         eff.fullscreen = fullscreen;
+        eff.fill = fill;
         eff.mute = mute;
         eff.watchdog = port_watchdog_sec;
         eff.refresh = refresh;
@@ -481,6 +486,7 @@ int main(int argc, char **argv) {
     port_video_set_internal_scale(internal_scale);
     port_video_set_subpixel(subpixel);
     port_video_set_filter(&filter);
+    port_video_set_fill(fill);
     if (window && !port_video_available()) {
         fprintf(stderr, "port: --window: this build has no window: configure with -DPSXSTACK_SDL=ON "
                         "(port/README.md \"The window\")\n");

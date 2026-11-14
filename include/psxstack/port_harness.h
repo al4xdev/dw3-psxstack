@@ -130,6 +130,7 @@ const char *port_filter_choices(int quoted);
  * 0 with the reason in `err` when it is malformed. */
 int port_filter_parse(const char *spec, PortFilter *f, char *err, size_t err_size);
 void port_video_set_filter(const PortFilter *f);
+void port_video_set_fill(int fill);
 int port_video_gpu_screenshot_add(const char *spec);
 /* A run without a window that has --gpu-screenshot: the GPU device and the rasteriser opened now, before the game
  * draws (SDL build; logged and skipped without a device). */
