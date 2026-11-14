@@ -4,7 +4,9 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__ /* SYS_sched_setaffinity (below); Windows has no such header */
 #include <sys/syscall.h>
+#endif
 #include <unistd.h>
 
 #include "platform.h"

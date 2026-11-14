@@ -194,8 +194,15 @@ function(psxstack_add_game target)
     endif()
 
     # ---- The game's units: one object library, each compiled through port_gen.py rename (C_COMPILER_LAUNCHER).
-    find_program(PSXSTACK_OBJCOPY NAMES ${CMAKE_OBJCOPY} objcopy NO_CMAKE_FIND_ROOT_PATH)
-    find_program(PSXSTACK_OBJDUMP NAMES ${CMAKE_OBJDUMP} objdump NO_CMAKE_FIND_ROOT_PATH)
+    # Windows cross-builds use llvm-mingw, whose CMake sets CMAKE_OBJCOPY/CMAKE_OBJDUMP to llvm-objcopy/llvm-objdump;
+    # llvm-objdump cannot inspect PE targets (`--info` lacks `pe-x86-64`), so WIN32 needs host GNU binutils directly.
+    if(WIN32)
+        find_program(PSXSTACK_OBJCOPY NAMES objcopy NO_CMAKE_FIND_ROOT_PATH)
+        find_program(PSXSTACK_OBJDUMP NAMES objdump NO_CMAKE_FIND_ROOT_PATH)
+    else()
+        find_program(PSXSTACK_OBJCOPY NAMES ${CMAKE_OBJCOPY} objcopy NO_CMAKE_FIND_ROOT_PATH)
+        find_program(PSXSTACK_OBJDUMP NAMES ${CMAKE_OBJDUMP} objdump NO_CMAKE_FIND_ROOT_PATH)
+    endif()
     if(NOT PSXSTACK_OBJCOPY OR NOT PSXSTACK_OBJDUMP)
         message(FATAL_ERROR "GNU objcopy and objdump (binutils) are needed on the host: the units' section renaming")
     endif()
@@ -293,6 +300,9 @@ function(psxstack_add_game target)
 
     # ---- The binary: the runtime, the adapter, the tables, the shim, the units (and on PE the bracket symbols).
     file(GLOB RUNTIME_SRCS CONFIGURE_DEPENDS "${PSXSTACK_ROOT}/runtime/*.c")
+    # The handheld's presenter and renderer join the build with their options (PSXSTACK_SDL2, PSXSTACK_EGL, below):
+    # fbdev_present.c includes <linux/fb.h> and the Linux ioctls, which break the Windows build.
+    list(FILTER RUNTIME_SRCS EXCLUDE REGEX "/runtime/(fbdev_present|render_gles)\\.c$")
     set(PLATFORM_SRCS "")
     if(WIN32)
         _psxstack_run("${PSXSTACK_PORT_GEN}" markers --id "${ID}" --overlays "${G_OVERLAYS}" --out "${GEN}/markers.c")

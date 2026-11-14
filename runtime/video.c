@@ -76,7 +76,9 @@ static int video_shot_count;
 static long video_converted_frame = -1; /* the frame video_pixels was converted at (the debug channel's screenshot) */
 static int video_gpu_wanted;            /* --renderer gpu / video.renderer "gpu" */
 static int video_gles_wanted;           /* --renderer gles: the offscreen GLES renderer (render_gles.c) */
+#ifdef PSXSTACK_EGL /* only the GLES paths read it: unused (-Werror) in the other builds */
 static int video_gles;                  /* the offscreen GLES renderer draws; the present still comes out through fbdev */
+#endif
 static int video_internal_scale = 1;    /* --internal-scale / video.internal_scale: the rasteriser's, 1..8 */
 static PortFilter video_filter;         /* --filter / video.filter: the hardware renderer's present (render_gpu_present.c) */
 static struct {
