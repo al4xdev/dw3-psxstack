@@ -59,6 +59,16 @@ static int disc_read(unsigned lba, u8 *sector) {
     return n == DISC_RAW_SECTOR;
 }
 
+int port_disc_read_user(unsigned lba, void *out) {
+    u8 sector[DISC_RAW_SECTOR];
+
+    if (disc_fd < 0 || !disc_read(lba, sector)) {
+        return 0;
+    }
+    memcpy(out, sector + 24, 2048); /* MODE2/2352: sync (12), header (4), subheader (8), then the user data */
+    return 1;
+}
+
 /* ---- the .cue ---- */
 
 /* The BIN the cue's first FILE line names, resolved against the cue's directory, into `out`. */

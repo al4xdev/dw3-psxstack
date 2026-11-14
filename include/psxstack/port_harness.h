@@ -19,6 +19,9 @@
  * port_disc_set_speed: "instant" or "realistic" (the default: the drive's double speed, seek time); 0 = unknown. */
 void port_disc_open(const char *path, int check_sha1);
 int port_disc_set_speed(const char *speed);
+/* port_disc_read_user: the 2048 user bytes of sector `lba` (the ISO 9660 numbering the game's file table uses), read
+ * outside LIBCD (no timing, no callback) for game code that needs the disc's original bytes; 1 on success. */
+int port_disc_read_user(unsigned lba, void *out);
 
 /* ---- framelog.c / state.c: the per-frame log, checkpoints, the record (tests/replay's shape) ----
  * port_framelog_open: either path may be NULL (no log / no record). The log is text, one line per frame and one per
