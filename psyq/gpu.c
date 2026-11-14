@@ -1390,6 +1390,9 @@ unsigned long long port_gpu_cycles(void) {
 
     asm volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
     return ((unsigned long long)hi << 32) | lo;
+#elif defined(_WIN32)
+    extern long long port_clock_ns(void);
+    return (unsigned long long)port_clock_ns();
 #else
     struct timespec ts;
 
@@ -2348,7 +2351,6 @@ void port_gpu_log_walk(unsigned long long cycles) {
 }
 
 void port_gpu_log_frame(void) {
-    struct timespec ts;
     long long now;
     double n;
     int i;
@@ -2358,8 +2360,18 @@ void port_gpu_log_frame(void) {
     if (!port_gpu_log_on) {
         return;
     }
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#ifdef _WIN32
+    {
+        extern long long port_clock_ns(void);
+        now = port_clock_ns();
+    }
+#else
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    }
+#endif
     if (gpu_log_sec == 0) {
         gpu_log_sec = now;
     }

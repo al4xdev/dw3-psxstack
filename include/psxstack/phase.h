@@ -36,12 +36,21 @@ __attribute__((weak)) PortPhase port_phase;
 extern PortPhase port_phase;
 #endif
 
+#ifdef _WIN32
+long long port_clock_ns(void);
+#endif
+
 static inline long long port_phase_now(void) {
+#ifdef _WIN32
+    port_phase.clocks++;
+    return port_clock_ns();
+#else
     struct timespec ts;
 
     port_phase.clocks++;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
 }
 
 static inline void port_phase_begin(int id) __attribute__((unused));

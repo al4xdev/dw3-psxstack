@@ -15,6 +15,8 @@
 
 #include "port_runtime.h"
 
+volatile sig_atomic_t port_quit_requested;
+
 #ifdef _WIN32
 
 /* ======================================================================================================== Windows */
@@ -286,6 +288,21 @@ void port_watchdog_start(int sec) {
     CloseHandle(t);
 }
 
+static volatile LONG win_quit_signals;
+
+static BOOL WINAPI win_ctrl_handler(DWORD type) {
+    (void)type;
+    if (InterlockedIncrement(&win_quit_signals) > 1) {
+        ExitProcess(1);
+    }
+    port_quit_requested = 1;
+    return TRUE;
+}
+
+void port_install_quit_handlers(void) {
+    SetConsoleCtrlHandler(win_ctrl_handler, TRUE);
+}
+
 void port_watchdog_kick(void) {
     if (win_watchdog_sec > 0) {
         win_watchdog_deadline_ms = (LONG64)GetTickCount64() + (LONG64)win_watchdog_sec * 1000;
@@ -416,7 +433,6 @@ void port_file_line_buffered(FILE *f) {
  * kept drawing. Ours is installed after SDL's (port_pump_init runs after the video), exits through the pump's own path at
  * the end of the next vsync - so the WAV header, the log and the record are finished - and leaves _exit to a second
  * signal. */
-volatile sig_atomic_t port_quit_requested;
 static volatile sig_atomic_t port_quit_signals;
 
 static void port_quit_handler(int sig) {
