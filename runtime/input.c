@@ -378,6 +378,17 @@ static u8 input_masked[INPUT_IDS];     /* inputs of a latched trigger */
 static SDL_Gamepad *input_gamepads[INPUT_MAX_GAMEPADS];
 static u16 input_applied;              /* the buttons last sent to psyq_pad_set */
 static int input_applied_any;          /* psyq_pad_set was called by this file */
+static u16 input_touch_bits;           /* currently held virtual touch buttons */
+static u16 input_touch_latch;          /* fast-tap latch: ensures brief taps between frames register once */
+
+void port_input_set_touch_bits(u16 bits) {
+    input_touch_latch |= (bits & ~input_touch_bits);
+    input_touch_bits = bits;
+}
+
+__attribute__((weak)) void port_touch_event(const void *sdl_event) {
+    (void)sdl_event;
+}
 
 /* ---- --input-test */
 static int input_test_step;  /* the current step (input_test_steps: done) */
@@ -487,7 +498,7 @@ static void input_actions_update(void) {
 }
 
 static u16 input_buttons(void) {
-    u16 bits = 0;
+    u16 bits = input_touch_bits | input_touch_latch;
     int i;
     for (i = 0; i < input_map_count; i++) {
         if (input_down[input_map[i].id] && !input_masked[input_map[i].id]) {
@@ -779,7 +790,17 @@ static void input_poll(void) {
             }
             break;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
+        case SDL_EVENT_WILL_ENTER_BACKGROUND:
             memset(input_key_down, 0, sizeof(input_key_down)); /* no key stays held while another window has them */
+            input_touch_bits = 0;
+            input_touch_latch = 0;
+            port_touch_event(&e);
+            break;
+        case SDL_EVENT_FINGER_DOWN:
+        case SDL_EVENT_FINGER_UP:
+        case SDL_EVENT_FINGER_MOTION:
+        case SDL_EVENT_FINGER_CANCELED:
+            port_touch_event(&e);
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             input_gamepad_added(e.gdevice.which);
@@ -805,10 +826,13 @@ void port_input_frame(void) {
     input_poll();
     if (!port_script_active && !port_debug_pad_owned) {
         u16 bits = input_buttons();
+        input_touch_latch = 0;
         psyq_pad_set(0, 1, bits);
         port_framelog_input(bits);
         input_applied = bits;
         input_applied_any = 1;
+    } else {
+        input_touch_latch = 0;
     }
     if (input_test) {
         input_test_after();

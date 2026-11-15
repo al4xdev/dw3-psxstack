@@ -305,22 +305,41 @@ static SDL_Window *video_window;
 static SDL_Renderer *video_renderer;
 static SDL_Texture *video_texture;
 static int video_tex_w, video_tex_h;
+static SDL_Texture *video_touch_tex;
+static u32 *video_touch_buf;
+static int video_touch_w, video_touch_h;
 static Uint64 video_start_ns;
 static long video_presents;
 static int video_gpu; /* the window presents through the hardware renderer */
 static int video_aspect[2] = { 4, 3 }; /* the presented picture's aspect: 4:3, or 16:9 at the display's pixel aspect */
+
+__attribute__((weak)) int port_touch_draw_rgba(u32 *rgba, int w, int h, const int game_rect[4]) {
+    (void)rgba;
+    (void)w;
+    (void)h;
+    (void)game_rect;
+    return -1;
+}
 
 int port_video_available(void) {
     return 1;
 }
 
 void port_video_open(int scale, int fullscreen) {
+#ifdef __ANDROID__
+    SDL_WindowFlags flags = SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    (void)fullscreen;
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#else
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
                             (fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         port_fatal("SDL_Init: %s (a host without a display: SDL_VIDEO_DRIVER=offscreen)", SDL_GetError());
     }
+#ifndef __ANDROID__
     atexit(SDL_Quit);
+#endif
     /* with widescreen and the GPU renderer, 16:9 at the same height (the picture switches between 4:3 and 16:9) */
     video_window = SDL_CreateWindow(PSXSTACK_GAME_ID, video_wide_wanted && video_gpu_wanted ? (240 * scale * 16 + 8) / 9
                                                                                            : 320 * scale,
@@ -474,8 +493,46 @@ static void video_present(void) {
     SDL_SetRenderDrawColor(video_renderer, 0, 0, 0, 255);
     SDL_RenderClear(video_renderer);
     if (SDL_GetCurrentRenderOutputSize(video_renderer, &ow, &oh) && ow > 0 && oh > 0) {
+        int tw, th, grect[4], tr;
         video_dest(ow, oh, &dst);
         SDL_RenderTexture(video_renderer, video_texture, NULL, &dst);
+        tw = ow <= 1280 ? ow : 1280;
+        th = (int)((long long)oh * tw / ow);
+        if (th < 1) {
+            th = 1;
+        }
+        grect[0] = (int)(dst.x * tw / ow);
+        grect[1] = (int)(dst.y * th / oh);
+        grect[2] = (int)(dst.w * tw / ow);
+        grect[3] = (int)(dst.h * th / oh);
+        if (video_touch_buf != NULL || port_touch_draw_rgba(NULL, tw, th, grect) >= 0) {
+            if (video_touch_buf == NULL || video_touch_w != tw || video_touch_h != th) {
+                free(video_touch_buf);
+                video_touch_buf = calloc((size_t)tw * (size_t)th, sizeof(u32));
+                if (video_touch_tex != NULL) {
+                    SDL_DestroyTexture(video_touch_tex);
+                    video_touch_tex = NULL;
+                }
+                video_touch_w = tw;
+                video_touch_h = th;
+            }
+            tr = video_touch_buf != NULL ? port_touch_draw_rgba(video_touch_buf, tw, th, grect) : -1;
+            if (tr >= 0) {
+                if (video_touch_tex == NULL) {
+                    video_touch_tex = SDL_CreateTexture(video_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                                        SDL_TEXTUREACCESS_STREAMING, tw, th);
+                    if (video_touch_tex != NULL) {
+                        SDL_SetTextureBlendMode(video_touch_tex, SDL_BLENDMODE_BLEND);
+                    }
+                }
+                if (video_touch_tex != NULL) {
+                    if (tr > 0) {
+                        SDL_UpdateTexture(video_touch_tex, NULL, video_touch_buf, tw * (int)sizeof(u32));
+                    }
+                    SDL_RenderTexture(video_renderer, video_touch_tex, NULL, NULL);
+                }
+            }
+        }
     }
     video_readback();
     SDL_RenderPresent(video_renderer);
@@ -527,6 +584,13 @@ void port_video_quit(void) {
     }
     render_gpu_tex_close();
     render_gpu_close(); /* the device too: destroyed before SDL_Quit, its claim before the window */
+    if (video_touch_tex != NULL) {
+        SDL_DestroyTexture(video_touch_tex);
+        video_touch_tex = NULL;
+    }
+    free(video_touch_buf);
+    video_touch_buf = NULL;
+    video_touch_w = video_touch_h = 0;
     if (video_texture != NULL) {
         SDL_DestroyTexture(video_texture);
         video_texture = NULL;

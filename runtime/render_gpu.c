@@ -56,6 +56,12 @@
 #include "render_gpu_textures.h"
 
 #include "render_gpu_shaders.h"
+#include "overlay_frag_spv.h"
+#ifdef _WIN32
+#include "overlay_frag_dxil.h"
+#endif
+
+extern int port_touch_draw_rgba(u32 *rgba, int w, int h, const int game_rect[4]);
 
 #define RENDER_IMAGE_W 640 /* video.c's VIDEO_MAX_W, VIDEO_MAX_H: the largest display image */
 #define RENDER_IMAGE_H 576
@@ -116,14 +122,19 @@ static struct {
     SDL_Window *window;                    /* claimed; NULL headless */
     SDL_GPUTextureFormat swap_format;      /* the swapchain's (SDR: B8G8R8A8 or R8G8B8A8 UNORM) */
     int dxil;                              /* the device takes DXIL, not SPIR-V (D3D12) */
-    SDL_GPUShader *vert, *frag, *frag_vram;
+    SDL_GPUShader *vert, *frag, *frag_vram, *overlay_frag;
     SDL_GPUGraphicsPipeline *pipe_swap, *pipe_vram_swap; /* the presents into the swapchain's format */
     SDL_GPUGraphicsPipeline *pipe_off, *pipe_vram_off;   /* into B8G8R8A8_UNORM (the readback target) */
+    SDL_GPUGraphicsPipeline *pipe_overlay_off, *pipe_overlay_swap;
     SDL_GPUSampler *sampler;               /* bound with the textures (the shaders read them with Load) */
     SDL_GPUSampler *sampler_linear;        /* a texture pack's replacements, filtered (render_gpu_packs.c) */
     SDL_GPUTexture *no_replacement;        /* bound in the replacement's slot while none is */
     SDL_GPUTexture *image;                 /* the software image, RENDER_IMAGE_W x RENDER_IMAGE_H */
     SDL_GPUTransferBuffer *upload;         /* its pixels on the way */
+    SDL_GPUTexture *overlay_tex;
+    SDL_GPUTransferBuffer *overlay_upload;
+    u32 *overlay_buf;
+    int overlay_w, overlay_h;
     SDL_GPUTexture *target;                /* the readback's offscreen target and its download buffer */
     SDL_GPUTransferBuffer *download;
     int target_w, target_h;
@@ -831,11 +842,12 @@ static void render_release(void) {
         render_present_release(r.device); /* the filter's pipelines (render_gpu_present.c) */
     }
     if (r.device != NULL) {
-        SDL_GPUTexture *textures[] = { r.target, r.image, r.vram_target, r.background, r.mirror, r.no_replacement };
-        SDL_GPUTransferBuffer *buffers[] = { r.download, r.upload, r.staging_buf, r.vram_download };
+        SDL_GPUTexture *textures[] = { r.target, r.image, r.overlay_tex, r.vram_target, r.background, r.mirror,
+                                       r.no_replacement };
+        SDL_GPUTransferBuffer *buffers[] = { r.download, r.upload, r.overlay_upload, r.staging_buf, r.vram_download };
         SDL_GPUGraphicsPipeline *pipes[] = { r.pipe_off, r.pipe_swap, r.pipe_vram_off, r.pipe_vram_swap,
-                                             r.pipe_raster };
-        SDL_GPUShader *shaders[] = { r.frag, r.vert, r.frag_vram, r.raster_vert, r.raster_frag };
+                                             r.pipe_overlay_off, r.pipe_overlay_swap, r.pipe_raster };
+        SDL_GPUShader *shaders[] = { r.frag, r.vert, r.frag_vram, r.overlay_frag, r.raster_vert, r.raster_frag };
         size_t i;
         for (i = 0; i < SDL_arraysize(textures); i++) {
             if (textures[i] != NULL) {
@@ -871,6 +883,7 @@ static void render_release(void) {
     }
     free(r.recs);
     free(r.staging);
+    free(r.overlay_buf);
     memset(&r, 0, sizeof(r));
 }
 
@@ -895,6 +908,30 @@ SDL_GPUGraphicsPipeline *render_pipeline(SDL_GPUShader *vert, SDL_GPUShader *fra
     memset(&ci, 0, sizeof(ci));
     memset(&target, 0, sizeof(target));
     target.format = format;
+    ci.vertex_shader = vert;
+    ci.fragment_shader = frag;
+    ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    ci.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    ci.target_info.color_target_descriptions = &target;
+    ci.target_info.num_color_targets = 1;
+    return SDL_CreateGPUGraphicsPipeline(r.device, &ci);
+}
+
+static SDL_GPUGraphicsPipeline *render_overlay_pipeline(SDL_GPUShader *vert, SDL_GPUShader *frag,
+                                                        SDL_GPUTextureFormat format) {
+    SDL_GPUGraphicsPipelineCreateInfo ci;
+    SDL_GPUColorTargetDescription target;
+    memset(&ci, 0, sizeof(ci));
+    memset(&target, 0, sizeof(target));
+    target.format = format;
+    target.blend_state.enable_blend = true;
+    target.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+    target.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+    target.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+    target.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+    target.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+    target.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
     ci.vertex_shader = vert;
     ci.fragment_shader = frag;
     ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
@@ -978,18 +1015,21 @@ int render_gpu_open(SDL_Window *window, char *why, size_t why_size) {
     r.vert = render_shader(RENDER_SHADER(present_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
     r.frag = render_shader(RENDER_SHADER(present_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
     r.frag_vram = render_shader(RENDER_SHADER(present_vram_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
-    if (r.vert == NULL || r.frag == NULL || r.frag_vram == NULL) {
+    r.overlay_frag = render_shader(RENDER_SHADER(overlay_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+    if (r.vert == NULL || r.frag == NULL || r.frag_vram == NULL || r.overlay_frag == NULL) {
         return render_fail(why, why_size, "SDL_CreateGPUShader");
     }
     r.pipe_off = render_pipeline(r.vert, r.frag, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
     r.pipe_vram_off = render_pipeline(r.vert, r.frag_vram, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
-    if (r.pipe_off == NULL || r.pipe_vram_off == NULL) {
+    r.pipe_overlay_off = render_overlay_pipeline(r.vert, r.overlay_frag, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
+    if (r.pipe_off == NULL || r.pipe_vram_off == NULL || r.pipe_overlay_off == NULL) {
         return render_fail(why, why_size, "SDL_CreateGPUGraphicsPipeline");
     }
     if (window != NULL && r.swap_format != SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM) {
         r.pipe_swap = render_pipeline(r.vert, r.frag, r.swap_format);
         r.pipe_vram_swap = render_pipeline(r.vert, r.frag_vram, r.swap_format);
-        if (r.pipe_swap == NULL || r.pipe_vram_swap == NULL) {
+        r.pipe_overlay_swap = render_overlay_pipeline(r.vert, r.overlay_frag, r.swap_format);
+        if (r.pipe_swap == NULL || r.pipe_vram_swap == NULL || r.pipe_overlay_swap == NULL) {
             return render_fail(why, why_size, "SDL_CreateGPUGraphicsPipeline (swapchain)");
         }
     }
@@ -1464,9 +1504,95 @@ int render_gpu_present(const u32 *pixels, int w, int h, const int *vram_xy, Rend
     if (swap != NULL) { /* NULL: the window is minimised or occluded; nothing to draw this frame */
         SDL_GPUGraphicsPipeline *pipe = vram_xy != NULL ? (r.pipe_vram_swap ? r.pipe_vram_swap : r.pipe_vram_off)
                                                         : (r.pipe_swap ? r.pipe_swap : r.pipe_off);
+        int ow = (int)(sw <= 1280 ? sw : 1280);
+        int oh = (int)((long long)sh * ow / (sw > 0 ? sw : 1));
+        int grect[4], tr = -1;
+        if (oh < 1) {
+            oh = 1;
+        }
         dest((int)sw, (int)sh, rect);
         render_clip(rect, (int)sw, (int)sh);
+        grect[0] = (int)((long long)rect[0] * ow / (sw > 0 ? (int)sw : 1));
+        grect[1] = (int)((long long)rect[1] * oh / (sh > 0 ? (int)sh : 1));
+        grect[2] = (int)((long long)rect[2] * ow / (sw > 0 ? (int)sw : 1));
+        grect[3] = (int)((long long)rect[3] * oh / (sh > 0 ? (int)sh : 1));
+        if (r.overlay_buf != NULL || port_touch_draw_rgba(NULL, ow, oh, grect) >= 0) {
+            if (r.overlay_buf == NULL || r.overlay_w != ow || r.overlay_h != oh) {
+                if (r.overlay_tex != NULL) {
+                    SDL_ReleaseGPUTexture(r.device, r.overlay_tex);
+                }
+                if (r.overlay_upload != NULL) {
+                    SDL_ReleaseGPUTransferBuffer(r.device, r.overlay_upload);
+                }
+                free(r.overlay_buf);
+                r.overlay_buf = calloc((size_t)ow * (size_t)oh, sizeof(u32));
+                r.overlay_tex = render_texture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, ow, oh, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                r.overlay_upload = render_buffer(SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, (Uint32)ow * (Uint32)oh * 4u);
+                r.overlay_w = ow;
+                r.overlay_h = oh;
+            }
+            if (r.overlay_buf != NULL && r.overlay_tex != NULL && r.overlay_upload != NULL) {
+                tr = port_touch_draw_rgba(r.overlay_buf, ow, oh, grect);
+                if (tr > 0) {
+                    void *omap = SDL_MapGPUTransferBuffer(r.device, r.overlay_upload, true);
+                    if (omap != NULL) {
+                        SDL_GPUTextureTransferInfo osrc;
+                        SDL_GPUTextureRegion odst;
+                        SDL_GPUCopyPass *ocopy;
+                        memcpy(omap, r.overlay_buf, (size_t)ow * (size_t)oh * 4u);
+                        SDL_UnmapGPUTransferBuffer(r.device, r.overlay_upload);
+                        memset(&osrc, 0, sizeof(osrc));
+                        osrc.transfer_buffer = r.overlay_upload;
+                        osrc.pixels_per_row = (Uint32)ow;
+                        osrc.rows_per_layer = (Uint32)oh;
+                        memset(&odst, 0, sizeof(odst));
+                        odst.texture = r.overlay_tex;
+                        odst.w = (Uint32)ow;
+                        odst.h = (Uint32)oh;
+                        odst.d = 1;
+                        ocopy = SDL_BeginGPUCopyPass(cb);
+                        SDL_UploadToGPUTexture(ocopy, &osrc, &odst, true);
+                        SDL_EndGPUCopyPass(ocopy);
+                    } else {
+                        tr = -1;
+                    }
+                }
+            }
+        }
         render_draw(cb, swap, pipe, w, h, vram_xy, rect, 1);
+        if (tr >= 0) {
+            SDL_GPUGraphicsPipeline *opipe = r.pipe_overlay_swap ? r.pipe_overlay_swap : r.pipe_overlay_off;
+            SDL_GPUColorTargetInfo oct;
+            SDL_GPURenderPass *opass;
+            SDL_GPUTextureSamplerBinding obind;
+            SDL_Rect oscissor;
+            Sint32 ou[8];
+            memset(&oct, 0, sizeof(oct));
+            oct.texture = swap;
+            oct.load_op = SDL_GPU_LOADOP_LOAD;
+            oct.store_op = SDL_GPU_STOREOP_STORE;
+            opass = SDL_BeginGPURenderPass(cb, &oct, 1, NULL);
+            SDL_BindGPUGraphicsPipeline(opass, opipe);
+            oscissor.x = 0;
+            oscissor.y = 0;
+            oscissor.w = (int)sw;
+            oscissor.h = (int)sh;
+            SDL_SetGPUScissor(opass, &oscissor);
+            obind.texture = r.overlay_tex;
+            obind.sampler = r.sampler;
+            SDL_BindGPUFragmentSamplers(opass, 0, &obind, 1);
+            ou[0] = 0;
+            ou[1] = 0;
+            ou[2] = (Sint32)sw;
+            ou[3] = (Sint32)sh;
+            ou[4] = ow;
+            ou[5] = oh;
+            ou[6] = 0;
+            ou[7] = 0;
+            SDL_PushGPUFragmentUniformData(cb, 0, ou, sizeof(ou));
+            SDL_DrawGPUPrimitives(opass, 3, 1, 0, 0);
+            SDL_EndGPURenderPass(opass);
+        }
     }
     if (!SDL_SubmitGPUCommandBuffer(cb)) {
         goto failed;
