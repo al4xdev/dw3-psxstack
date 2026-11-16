@@ -43,7 +43,10 @@ window (`video.window`, `scale`, `fullscreen`, `refresh`), `audio.mute`, the mem
 `card2.mcd` beside the file, created formatted when missing; `null` for no card), the watchdog (default off), and the
 `input` and `mods` sections. Paths in the file are relative to its directory. The options given on the command line
 override the file. The game reads a settings file only when `--config` names it: the bare binary, which the tests run,
-never depends on the machine. A bad value exits 64 naming the key; an unknown key is logged and ignored.
+never depends on the machine. The one exception is `RECOMPLAUNCHER=1` with no `--config` (RecompLauncher's Play): the
+runtime then loads the launcher's usual `settings.json` (a `portable.txt` beside the executable, else SDL's per-user
+folder) and, unless already passed, puts crash reports and data mods beside it. `--game PATH` is the same option as
+`--disc`. A bad value exits 64 naming the key; an unknown key is logged and ignored.
 ```sh
 build/port-sdl/<game> --config <settings dir>/settings.json                   # as the launcher starts it
 build/port/<game> --config settings.json --print-settings                     # the effective settings, every key

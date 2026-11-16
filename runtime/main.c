@@ -16,6 +16,9 @@
 #include "spu.h"
 #include "psyq.h"
 #include "savestate.h"
+#ifdef PSXSTACK_SDL
+#include <SDL3/SDL.h>
+#endif
 
 int port_trace;
 
@@ -106,7 +109,7 @@ static void port_cpu_pin(void) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [--config JSON] [--print-settings] [--print-mods] [--script-mods] [--refresh 50|60]\n"
-            "          [--disc CUE|BIN] [--no-disc-check] [--cd-speed instant|realistic] [--memcard1|2 MCD|none]\n"
+            "          [--disc CUE|BIN] [--game CUE|BIN] [--no-disc-check] [--cd-speed instant|realistic] [--memcard1|2 MCD|none]\n"
             "          [--script JSON]\n"
             "          [--log FILE] [--record FILE] [--max-frames N] [--watchdog SEC] [--trace]\n"
             "          [--window] [--scale N] [--fullscreen] [--fps N] [--input-test] [--screenshot FRAME:PATH]\n"
@@ -124,7 +127,8 @@ static void usage(const char *argv0) {
             "  --script-mods    with --script: keep the settings' mods on (default: every mod off under a script)\n"
             "  --refresh HZ     50 (PAL, the default) or 60: the game's own 60 Hz mode (the NTSC patch's flag), the\n"
             "                   pace, the audio's and the CD's rate (overrides the settings' video.refresh)\n"
-            "  --disc PATH      the user's disc (.cue or .bin; SHA-1 checked); without it reads find no data\n"
+            "  --disc PATH      the user's disc (.cue or .bin; SHA-1 checked); without it reads find no data;\n"
+            "                   --game PATH is the same option (launchers and shortcuts)\n"
             "  --no-disc-check  skip the disc's SHA-1 check (experiments with another image)\n"
             "  --cd-speed S     the CD's timing: realistic (default: double speed and seeks) or instant\n"
             "  --memcard1 P     memory card 1: a .mcd image (created if missing), or none; default: a fresh card in\n"
@@ -203,6 +207,74 @@ static long number(const char *s, const char *opt) {
     return v;
 }
 
+/* RecompLauncher sets this on every start. A normal start never has it, so the lookup below
+ * stays out of tests and of a player who opened the game themselves. */
+static int recomplauncher_on(void) {
+    const char *e = getenv("RECOMPLAUNCHER");
+    return e != NULL && strcmp(e, "1") == 0;
+}
+
+#ifdef PSXSTACK_SDL
+/* Filled once when RecompLauncher starts the game, then reused for the settings file, crashes and mods. */
+static char rl_dir[1024];
+static char rl_settings[1024];
+static char rl_crash[1024];
+static char rl_mods[1024];
+
+/* The settings directory dw2003-launcher would pick, minus its current-directory fallback (that one
+ * is for a developer running the binary by hand). portable.txt beside this executable, else SDL's
+ * per-user folder. `out` gets the directory with its trailing separator. */
+static int recomplauncher_settings_dir(char *out, size_t n) {
+    const char *base = SDL_GetBasePath();
+    char portable[1024];
+    FILE *f;
+
+    if (base != NULL && strlen(base) + 16 < sizeof(portable)) {
+        snprintf(portable, sizeof(portable), "%sportable.txt", base);
+        f = fopen(portable, "rb");
+        if (f != NULL) {
+            fclose(f);
+            if (strlen(base) >= n) {
+                return 0;
+            }
+            memcpy(out, base, strlen(base) + 1);
+            return 1;
+        }
+    }
+    {
+        char *pref = SDL_GetPrefPath("", PSXSTACK_GAME_ID);
+        size_t len;
+        if (pref == NULL) {
+            return 0;
+        }
+        len = strlen(pref);
+        if (len >= n) {
+            SDL_free(pref);
+            return 0;
+        }
+        memcpy(out, pref, len + 1);
+        SDL_free(pref);
+    }
+    return 1;
+}
+
+/* settings.json in that directory, when it is already there. A missing file is not an error: Play
+ * still has --disc and --window, and the launcher writes the file before the next start. */
+static const char *recomplauncher_settings_file(char *out, size_t n, const char *dir) {
+    FILE *f;
+    int wrote = snprintf(out, n, "%ssettings.json", dir);
+    if (wrote < 0 || (size_t)wrote >= n) {
+        return NULL;
+    }
+    f = fopen(out, "rb");
+    if (f == NULL) {
+        return NULL;
+    }
+    fclose(f);
+    return out;
+}
+#endif
+
 static void status_emit(const char *tag) {
     const char *e = getenv("DW3_STATUS_FD");
     int fd;
@@ -248,6 +320,14 @@ int main(int argc, char **argv) {
             config = argv[++i];
         }
     }
+#ifdef PSXSTACK_SDL
+    /* RecompLauncher writes settings.json where the launcher keeps it, then starts the game with
+     * --disc and no --config. Load that file so saves, mods and the picture match a normal start. */
+    if (config == NULL && recomplauncher_on() && recomplauncher_settings_dir(rl_dir, sizeof(rl_dir)) &&
+        recomplauncher_settings_file(rl_settings, sizeof(rl_settings), rl_dir) != NULL) {
+        config = rl_settings;
+    }
+#endif
     if (config != NULL) {
         port_settings_load(config);
         disc = port_settings.disc;
@@ -292,7 +372,7 @@ int main(int argc, char **argv) {
             port_max_frames = number(argv[i + 1], argv[i]);
             max_frames_given = 1;
             i++;
-        } else if (strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
+        } else if ((strcmp(argv[i], "--disc") == 0 || strcmp(argv[i], "--game") == 0) && i + 1 < argc) {
             disc = argv[++i];
         } else if (strcmp(argv[i], "--no-disc-check") == 0) {
             disc_check = 0;
@@ -431,6 +511,21 @@ int main(int argc, char **argv) {
         }
         port_pace_set(fps);
     }
+#ifdef PSXSTACK_SDL
+    /* Crash reports and data mods live beside the settings file, as the launcher passes them.
+     * Only filled in when RecompLauncher did not already pass the paths. */
+    if (recomplauncher_on() && rl_dir[0] == '\0') {
+        recomplauncher_settings_dir(rl_dir, sizeof(rl_dir));
+    }
+    if (recomplauncher_on() && rl_dir[0] != '\0') {
+        if (crash_dir == NULL && snprintf(rl_crash, sizeof(rl_crash), "%scrashes", rl_dir) > 0) {
+            crash_dir = rl_crash;
+        }
+        if (mods_dir == NULL && snprintf(rl_mods, sizeof(rl_mods), "%smods", rl_dir) > 0) {
+            mods_dir = rl_mods;
+        }
+    }
+#endif
     port_input_settings(config != NULL ? port_settings.input : NULL);
     if (mods_dir != NULL && !port_video_available()) {
         fprintf(stderr, "port: --mods-dir: this build has no data mods: configure with -DPSXSTACK_SDL=ON\n");
@@ -540,6 +635,13 @@ int main(int argc, char **argv) {
     if (window) {
         if (!max_frames_given) {
             port_max_frames = 0; /* a window runs until it is closed */
+        }
+        /* Couch play: RecompLauncher has the controller, and often no keyboard in reach. */
+        if (recomplauncher_on()) {
+            const char *mode = getenv("RECOMPLAUNCHER_MODE");
+            if (mode != NULL && strcmp(mode, "bigpicture") == 0) {
+                fullscreen = 1;
+            }
         }
         status_emit("start");
         port_video_open(scale, fullscreen);
