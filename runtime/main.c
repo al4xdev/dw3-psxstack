@@ -131,6 +131,7 @@ static void usage(const char *argv0) {
             "                   --game PATH is the same option (launchers and shortcuts)\n"
             "  --no-disc-check  skip the disc's SHA-1 check (experiments with another image)\n"
             "  --cd-speed S     the CD's timing: realistic (default: double speed and seeks) or instant\n"
+            "                   (the data reads; the movie stream stays realistic)\n"
             "  --memcard1 P     memory card 1: a .mcd image (created if missing), or none; default: a fresh card in\n"
             "                   memory (--memcard2 likewise)\n"
             "  --script JSON    an input script (tests/replay/scripts/*.json); the run ends when it does\n"

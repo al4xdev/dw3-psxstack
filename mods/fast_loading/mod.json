@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "id": "fast_loading",
+  "name": "Faster loading",
+  "version": "0.1",
+  "kind": "builtin",
+  "requires_port": 1,
+  "description": "Makes the CD drive read the game's files faster, so the install and the loads between screens are shorter. Movies and their sound keep the drive's normal speed. The game runs fewer frames while it loads, so later random events can differ from a run without the mod.",
+  "options": [
+    { "id": "speed", "name": "Speed", "description": "How fast the drive reads the game's files, as a multiple of a real double-speed drive, or at once.",
+      "type": "enum", "default": "4x", "applies": "live",
+      "values": [
+        { "id": "2x", "label": "2x" }, { "id": "4x", "label": "4x" }, { "id": "8x", "label": "8x" },
+        { "id": "instant", "label": "Instant" }
+      ] }
+  ]
+}

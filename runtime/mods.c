@@ -1,5 +1,5 @@
 /* The built-in mods' engine (docs/LAUNCHER.md "Mod runtime"; GAME_CONTRACT.md "4. The adapter units": the mods): the
- * registry (the runtime's own fast_forward, then the game's PortMod records, psxstack/game.h game_mods), their
+ * registry (the runtime's own fast_forward and fast_loading, then the game's PortMod records, psxstack/game.h game_mods), their
  * settings (`mods.<id>`, "Mods section"), their hotkeys, their callbacks every vsync (port_mods_frame), the window's
  * status text, and the registry's JSON (--print-mods), which tests/port/settings.py checks against the manifests
  * (mods/<id>/mod.json). The mods that change the game live in the game adapter (port/game/game_mods.c) and reach the
@@ -78,8 +78,40 @@ static PortMod ff_mod = { .id = "fast_forward", .version = "0.1", .options = ff_
                           .option_count = (int)(sizeof(ff_options) / sizeof(ff_options[0])), .start = ff_start,
                           .frame = ff_frame };
 
-/* ---- The registry: the runtime's fast_forward, then the game's mods (psxstack/game.h game_mods), in that order for
- * the settings, --print-mods and the manifests. */
+/* ---- fast_loading (docs/LAUNCHER.md "Faster loading"): runtime only, no game C. While it is enabled the CD's data
+ * reads (psyq/libcd.c: ReadN/ReadS without the XA bit) run at `speed` times the drive's rate with their seeks
+ * shortened as much, or at once (instant: no seek), through port_disc_fast_loading; the movie stream and XA audio
+ * keep the drive's rate. Unlike fast_forward it changes the game's run: a load ends in fewer vsyncs, so whatever the
+ * game does every frame (a generator stepped once a frame) can come out differently later. Every read still completes
+ * through the game's own callbacks. The speed applies from the vsync it is set on. */
+static const char *const fl_speeds[] = { "2x", "4x", "8x", "instant", NULL };
+static const int fl_multiples[] = { 2, 4, 8, 0 };
+enum { FL_SPEED };
+static const PortModOption fl_options[] = {
+    { .id = "speed", .type = PORT_MOD_ENUM, .def = "\"4x\"", .values = fl_speeds, .applies = "live" },
+};
+static int fl_applied = 1; /* the multiple applied (port_disc_fast_loading); 1: none */
+
+static void fl_frame(struct PortMod *mod) {
+    int multiple = fl_multiples[(int)mod->values[FL_SPEED].number];
+    if (multiple != fl_applied) {
+        fl_applied = multiple;
+        port_disc_fast_loading(multiple);
+        port_log("fast loading: the CD's data reads %s at frame %ld", fl_speeds[(int)mod->values[FL_SPEED].number],
+                 port_frames);
+    }
+}
+
+static void fl_start(struct PortMod *mod) {
+    fl_frame(mod);
+}
+
+static PortMod fl_mod = { .id = "fast_loading", .version = "0.1", .options = fl_options,
+                          .option_count = (int)(sizeof(fl_options) / sizeof(fl_options[0])), .start = fl_start,
+                          .frame = fl_frame };
+
+/* ---- The registry: the runtime's fast_forward and fast_loading, then the game's mods (psxstack/game.h game_mods),
+ * in that order for the settings, --print-mods and the manifests. */
 #define MODS_MAX 32
 static PortMod *mods_all[MODS_MAX];
 static int mods_count;
@@ -89,14 +121,15 @@ static void mods_init(void) {
     if (mods_count != 0) {
         return;
     }
-    if (n + 1 > MODS_MAX) {
-        port_fatal("mods: %d game mods, at most %d", n, MODS_MAX - 1);
+    if (n + 2 > MODS_MAX) {
+        port_fatal("mods: %d game mods, at most %d", n, MODS_MAX - 2);
     }
     mods_all[0] = &ff_mod;
+    mods_all[1] = &fl_mod;
     for (i = 0; i < n; i++) {
-        mods_all[1 + i] = &game_mods()[i];
+        mods_all[2 + i] = &game_mods()[i];
     }
-    mods_count = 1 + n;
+    mods_count = 2 + n;
 }
 
 static int mod_enum_index(const PortModOption *o, const char *id) {

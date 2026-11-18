@@ -22,10 +22,14 @@ void psyq_set_vsync_pre_hook(void (*hook)(void));
 int psyq_cd_tick(void);
 /* LIBCD's timing model (port_disc_set_speed): PSYQ_CD_REALISTIC (the default) = the drive's speed from the Setmode
  * byte (bit 0x80: 150 sectors/s, else 75) at 50 vsyncs/s and a seek delay before a read's first sector;
- * PSYQ_CD_INSTANT = no seek, and a read delivers up to 75 sectors per tick, as many as the game takes. */
+ * PSYQ_CD_INSTANT = no seek, and a data read delivers up to 75 sectors per tick, as many as the game takes. The movie
+ * stream and the reads with the XA bit keep the realistic drive under either (libcd.c's header). */
 #define PSYQ_CD_REALISTIC 0
 #define PSYQ_CD_INSTANT 1
 void psyq_cd_set_timing(int timing);
+/* The data reads' speed under PSYQ_CD_REALISTIC (port_disc_fast_loading, the fast_loading mod): the drive's rate times
+ * `multiple` and its seeks divided by it; 1 (the default) = the drive's. Kept by the reset, as the timing is. */
+void psyq_cd_set_data_speed(int multiple);
 /* The vsyncs per second the CD's ticks come at (50, PAL, by default; 60 with the 60 Hz setting): the drive's sectors and
  * the XA audio per tick follow it. Kept by the reset, as the timing is. */
 void psyq_cd_set_vsync_hz(int hz);

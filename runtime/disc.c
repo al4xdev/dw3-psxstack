@@ -18,7 +18,8 @@
  * run's output does not depend on the cache. An unwritable cache directory only costs the next run its shortcut.
  *
  * port_disc_set_speed selects LIBCD's timing model (psyq_cd_set_timing; psyq/libcd.c): "realistic" (the
- * default) or "instant". */
+ * default) or "instant". port_disc_fast_loading (the fast_loading mod, runtime/mods.c) speeds the data reads up on
+ * top of it, and back. Movies and XA reads keep the realistic drive. */
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -307,14 +308,21 @@ void port_disc_open(const char *path, int check_sha1) {
     psyq_cd_set_reader(disc_read);
 }
 
+static int disc_timing = PSYQ_CD_REALISTIC; /* port_disc_set_speed's; fast_loading restores it when it is not instant */
+
 int port_disc_set_speed(const char *speed) {
     if (strcmp(speed, "realistic") == 0) {
-        psyq_cd_set_timing(PSYQ_CD_REALISTIC);
-        return 1;
+        disc_timing = PSYQ_CD_REALISTIC;
+    } else if (strcmp(speed, "instant") == 0) {
+        disc_timing = PSYQ_CD_INSTANT;
+    } else {
+        return 0;
     }
-    if (strcmp(speed, "instant") == 0) {
-        psyq_cd_set_timing(PSYQ_CD_INSTANT);
-        return 1;
-    }
-    return 0;
+    psyq_cd_set_timing(disc_timing);
+    return 1;
+}
+
+void port_disc_fast_loading(int multiple) {
+    psyq_cd_set_timing(multiple == 0 ? PSYQ_CD_INSTANT : disc_timing);
+    psyq_cd_set_data_speed(multiple == 0 ? 1 : multiple);
 }

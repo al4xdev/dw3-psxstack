@@ -20,8 +20,12 @@
  *    Drive"): a Setloc + read first moves the sled and waits for the target sector's address to come by, a few
  *    tens of ms nearby up to about a second over the whole disc, with no fixed formula; this model is a
  *    deterministic stand-in, not a measurement. A read with no Setloc since the last one continues at the head.
- *  - Timing "instant": no seek; sectors start in the same tick as the acknowledgement, up to
- *    PSYQ_CD_INSTANT_SECTORS per tick (as many as the game takes before it pauses or issues a command).
+ *  - Timing "instant": no seek; a data read delivers up to PSYQ_CD_INSTANT_SECTORS per tick, as many as the game
+ *    takes before it pauses or issues a command. The data speed (psyq_cd_set_data_speed: realistic's rate times N,
+ *    its seek divided by N; the runtime's fast_loading mod) applies to data reads only: ReadN/ReadS whose Setmode
+ *    byte has no XA bit (0x40). The stream (CdRead2) and any read with the XA bit keep the realistic drive, whatever
+ *    the timing: a movie's frames and its XA audio come at the drive's rate, which is what the player and the SPU's
+ *    CD input are paced by (faster, the video would run at the decoder's speed and the XA FIFO would overflow).
  *
  * The stream (stdwtitl_80082D70.c's player: StSetRing(ring, 32 sectors), StSetStream, CdControl Setloc/Setmode,
  * CdRead2(0x1E0), then StGetNext/StFreeRing per frame, CdControlB(Pause) + StUnSetRing at the end) reads from the
@@ -34,9 +38,9 @@
  * the oldest complete frame (*addr = its data, *header = its StHEADER), StFreeRing(addr) releases it. This layout is
  * ours (LIBCD's own placement of headers and data in the ring is not documented publicly); it keeps every pointer
  * the game sees inside game memory (the arena) and the data contiguous, which is what DecDCTvlc2 needs.
- * When the ring has no room for a new frame: "realistic" drops the frame's sectors (the drive keeps reading at its
- * rate: a consumer too slow loses frames, as LIBCD's ring overflows; to verify), "instant" waits (the sector is
- * read again on a later tick).
+ * When the ring has no room for a new frame, the frame's sectors are dropped (the drive keeps reading at its
+ * rate: a consumer too slow loses frames, as LIBCD's ring overflows; to verify). The stream is never the instant
+ * path, so a full ring does not stall the drive.
  *
  * StGetNext is polled without a wait hook (stdwtitl_get_next_frame: up to 2000 x 2000 polls); on the PS1 the CD and
  * vsync interrupts keep running while it spins. Here every PSYQ_ST_POLLS_PER_VSYNC consecutive empty polls run one
@@ -119,6 +123,7 @@ u8 StCdIntrFlag; /* LIBCD's StCdIntrFlag: set by the CD interrupt while MDEC run
 enum { CD_IDLE, CD_READ, CD_STREAM };
 
 static int psyq_cd_timing = PSYQ_CD_REALISTIC;
+static int psyq_cd_data_speed = 1; /* the data reads' multiple of the realistic drive (psyq_cd_set_data_speed) */
 static int psyq_cd_vsync_hz = 50; /* the vsyncs per second (psyq_cd_set_vsync_hz): 50 (PAL) or 60 */
 static PsyqCdHandler psyq_cd_sync_handler;
 static PsyqCdHandler psyq_cd_ready_handler;
@@ -176,6 +181,16 @@ void psyq_cd_set_reader(int (*read)(unsigned lba, u8 *sector)) {
 
 void psyq_cd_set_timing(int timing) {
     psyq_cd_timing = timing;
+}
+
+void psyq_cd_set_data_speed(int multiple) {
+    psyq_cd_data_speed = multiple > 1 ? multiple : 1;
+}
+
+/* A read of `kind` under the Setmode byte is a data read (the header comment): the timing and the data speed apply.
+ * The movie stream, and a read with the XA bit, keep the realistic drive. */
+static int psyq_cd_is_data(int kind) {
+    return kind != CD_STREAM && (psyq_cd_mode & 0x40) == 0;
 }
 
 void psyq_cd_set_vsync_hz(int hz) {
@@ -308,14 +323,18 @@ static void psyq_cd_set_result(u8 *result) {
 static void psyq_cd_start_read(int kind) {
     u32 target = psyq_cd_loc_new ? psyq_cd_loc : psyq_cd_head;
     u32 dist = target > psyq_cd_head ? target - psyq_cd_head : psyq_cd_head - target;
+    int data = psyq_cd_is_data(kind);
 
     psyq_cd_seek_ticks = 0;
-    if (psyq_cd_timing == PSYQ_CD_REALISTIC && psyq_cd_loc_new) {
+    if (!(data && psyq_cd_timing == PSYQ_CD_INSTANT) && psyq_cd_loc_new) {
         psyq_cd_seek_ticks = PSYQ_CD_SEEK_BASE + (int)(dist / PSYQ_CD_SEEK_SPAN);
         if (psyq_cd_seek_ticks > PSYQ_CD_SEEK_MAX) {
             psyq_cd_seek_ticks = PSYQ_CD_SEEK_MAX;
         }
         psyq_cd_seek_ticks = psyq_cd_seek_ticks * psyq_cd_vsync_hz / 50; /* the same time at 60 Hz */
+        if (data) {
+            psyq_cd_seek_ticks /= psyq_cd_data_speed;
+        }
     }
     PSYQ_TRACE("cd: %s from sector %u (head %u, seek %d tick(s)), %s speed", kind == CD_STREAM ? "stream" : "read",
                target, psyq_cd_head, psyq_cd_seek_ticks, (psyq_cd_mode & 0x80) ? "double" : "single");
@@ -490,7 +509,7 @@ static PsyqStSlot *st_reserve(u32 len) {
     return s;
 }
 
-/* One sector of the stream. 1 = consumed; 0 = not taken (instant timing: no room for its frame, read it again). */
+/* One sector of the stream. 1 = consumed. A full ring drops the frame: the stream keeps the drive's rate. */
 static int st_sector(u32 lba) {
     const u8 *d = psyq_cd_raw + 24; /* Form 1 data */
     u32 sc, ns, fc;
@@ -515,9 +534,6 @@ static int st_sector(u32 lba) {
     if (s == NULL || s->state != ST_ASSEMBLING) {
         s = st_reserve(ST_HEADER_SIZE + ns * ST_DATA_SIZE);
         if (s == NULL) {
-            if (psyq_cd_timing == PSYQ_CD_INSTANT) {
-                return 0;
-            }
             PSYQ_TRACE("stream: frame %u dropped at sector %u: the ring is full", fc, lba);
             st_skip_frame = fc;
             return 1;
@@ -589,7 +605,7 @@ static int psyq_cd_deliver(int n, u8 *result) {
 
 static int psyq_cd_tick_drive(void) {
     u8 result[8];
-    int ran = 0, n;
+    int ran = 0, n, data;
 
     psyq_cd_set_result(result);
     psyq_cd_ack_tick = 0;
@@ -608,7 +624,8 @@ static int psyq_cd_tick_drive(void) {
     if (psyq_cd_reading == CD_IDLE) {
         return ran;
     }
-    if (psyq_cd_timing == PSYQ_CD_INSTANT) {
+    data = psyq_cd_is_data(psyq_cd_reading);
+    if (data && psyq_cd_timing == PSYQ_CD_INSTANT) {
         n = PSYQ_CD_INSTANT_SECTORS;
     } else if (psyq_cd_ack_tick) {
         n = 0;
@@ -616,7 +633,7 @@ static int psyq_cd_tick_drive(void) {
         psyq_cd_seek_ticks--;
         n = 0;
     } else {
-        psyq_cd_rate_acc += (psyq_cd_mode & 0x80) ? 150 : 75;
+        psyq_cd_rate_acc += ((psyq_cd_mode & 0x80) ? 150 : 75) * (data ? psyq_cd_data_speed : 1);
         n = psyq_cd_rate_acc / psyq_cd_vsync_hz;
         psyq_cd_rate_acc %= psyq_cd_vsync_hz;
     }
