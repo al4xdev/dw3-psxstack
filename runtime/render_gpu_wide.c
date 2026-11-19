@@ -286,19 +286,25 @@ void render_gpu_wide_event(const GpuEvent *ev) {
         render_gpu_unit_event(&t, ev->area_x0 + dx);
         break;
     case GPU_EV_SEGMENT:
-        if (wide_area_slot(ev) != NULL) {
-            int x0 = ev->v[0].x < ev->v[1].x ? ev->v[0].x : ev->v[1].x;
-            int y0 = ev->v[0].y < ev->v[1].y ? ev->v[0].y : ev->v[1].y;
-            int x1 = ev->v[0].x > ev->v[1].x ? ev->v[0].x : ev->v[1].x;
-            int y1 = ev->v[0].y > ev->v[1].y ? ev->v[0].y : ev->v[1].y;
-            x0 = x0 > ev->area_x0 ? x0 : ev->area_x0;
-            y0 = y0 > ev->area_y0 ? y0 : ev->area_y0;
-            x1 = x1 < ev->area_x1 ? x1 : ev->area_x1;
-            y1 = y1 < ev->area_y1 ? y1 : ev->area_y1;
-            if (x0 <= x1 && y0 <= y1) {
-                wide_mirror(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-            }
+        /* Draw directly into the wide canvas (like triangles/rects) instead of wide_mirror: mirroring each line
+         * segment forced a background copy and Vulkan render-pass break per segment, which stalls mobile TBDR GPUs
+         * on wireframe scenes. */
+        s = wide_area_slot(ev);
+        if (s == NULL) {
+            return;
         }
+        dx = s->cx - s->x;
+        dy = s->cy - s->y;
+        t = *ev;
+        t.area_x0 += ev->area_x0 == s->x ? dx - wide.pad : dx;
+        t.area_x1 += ev->area_x1 == s->x + wide.w - 1 ? dx + wide.pad : dx;
+        t.area_y0 += dy;
+        t.area_y1 += dy;
+        t.v[0].x += dx;
+        t.v[0].y += dy;
+        t.v[1].x += dx;
+        t.v[1].y += dy;
+        render_gpu_unit_event(&t, ev->area_x0 + dx);
         break;
     case GPU_EV_FILL:
         /* a fill ignores the drawing area: one inside a buffer is drawn into its canvas too (across it: widened) */

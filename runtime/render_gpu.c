@@ -78,7 +78,7 @@ extern int port_touch_draw_rgba(u32 *rgba, int w, int h, const int game_rect[4])
 
 /* ---- The units (raster.vert.hlsl's and raster.frag.hlsl's uniforms) ---- */
 
-enum { OP_TRIANGLE, OP_RECT, OP_FILL, OP_COPY, OP_LOAD };
+enum { OP_TRIANGLE, OP_RECT, OP_FILL, OP_COPY, OP_LOAD, OP_SEGMENT };
 enum {
     F_RAW = 1,
     F_SEMI = 2,
@@ -547,63 +547,82 @@ static void raster_rect(const GpuEvent *ev) {
     mark_dirty(x, y, w, h);
 }
 
-/* A segment's pixels, collected by gpu_segment_walk. */
-typedef struct {
-    int n, cap;
-    int (*px)[5];
-} Pixels;
-
-static void collect_pixel(void *ctx, int x, int y, int cr, int cg, int cb) {
-    Pixels *p = ctx;
-    if (p->n == p->cap) {
-        int cap = p->cap ? p->cap * 2 : 1024;
-        void *n = realloc(p->px, (size_t)cap * sizeof(*p->px));
-        if (n == NULL) {
-            port_fatal("renderer: gpu: out of memory (a line of %d pixels)", cap);
-        }
-        p->px = n;
-        p->cap = cap;
-    }
-    p->px[p->n][0] = x;
-    p->px[p->n][1] = y;
-    p->px[p->n][2] = cr;
-    p->px[p->n][3] = cg;
-    p->px[p->n][4] = cb;
-    p->n++;
-}
-
+/* A line segment as one OP_SEGMENT draw over its clipped bounding box: raster.frag.hlsl evaluates the exact integer
+ * stepping of psyq/gpu.c's gpu_segment_walk per VRAM pixel, avoiding per-pixel draws and widescreen background copies. */
 static void raster_segment(const GpuEvent *ev) {
-    static Pixels pixels;
+    const GpuVertex *a0 = &ev->v[0], *b0 = &ev->v[1];
+    const GpuVertex *a = a0, *b = b0, *ca, *cb;
+    int dx = b->x - a->x, dy = b->y - a->y;
+    int adx = abs(dx), ady = abs(dy);
+    int xmajor = adx >= ady;
+    int major, minor, c, sx, sy;
+    int xlim = ev->area_x1, ylim = ev->area_y1;
+    int x0, y0, x1, y1, w, h;
     RasterUnit u;
-    int i, x0 = VRAM_W, y0 = VRAM_H, x1 = -1, y1 = -1;
+    Record *e;
 
-    pixels.n = 0;
-    gpu_segment_walk(&ev->v[0], &ev->v[1], ev->gouraud, collect_pixel, &pixels);
-    if (pixels.n == 0) {
+    if (adx > 1023 || ady > 511) {
         return;
     }
-    for (i = 0; i < pixels.n; i++) {
-        x0 = SDL_min(x0, pixels.px[i][0]);
-        y0 = SDL_min(y0, pixels.px[i][1]);
-        x1 = SDL_max(x1, pixels.px[i][0]);
-        y1 = SDL_max(y1, pixels.px[i][1]);
+    if ((xmajor && dx < 0) || (!xmajor && dy < 0)) {
+        const GpuVertex *t = a;
+        a = b;
+        b = t;
+        dx = -dx;
+        dy = -dy;
     }
-    unit_mode(&u, OP_RECT, ev);
-    u.kind[1] &= ~F_GOURAUD; /* the walk gives each pixel's colour */
+    if (dx != 0 && dy != 0) {
+        xlim--;
+        ylim--;
+    }
+    if (!xmajor && dx < 0) {
+        ca = b0;
+        cb = a0;
+    } else {
+        ca = a0;
+        cb = b0;
+    }
+    sx = dx < 0 ? -1 : 1;
+    sy = dy < 0 ? -1 : 1;
+    if (xmajor) {
+        major = adx;
+        minor = ady;
+        c = (major + minor - 1) >> 1;
+    } else {
+        major = ady;
+        minor = adx;
+        c = dx > 0 ? (major - 1) >> 1 : major >> 1;
+    }
+    x0 = SDL_max(SDL_min(a->x, b->x), ev->area_x0);
+    y0 = SDL_max(SDL_min(a->y, b->y), ev->area_y0);
+    x1 = SDL_min(SDL_max(a->x, b->x), xlim);
+    y1 = SDL_min(SDL_max(a->y, b->y), ylim);
+    w = x1 - x0 + 1;
+    h = y1 - y0 + 1;
+    if (w <= 0 || h <= 0 || !clip(&x0, &y0, &w, &h)) {
+        return;
+    }
+    unit_mode(&u, OP_SEGMENT, ev);
+    u.a[0] = a->x;
+    u.a[1] = a->y;
+    u.a[2] = major;
+    u.a[3] = minor;
+    u.col[0] = ca->r;
+    u.col[1] = ca->g;
+    u.col[2] = ca->b;
+    u.nrg[0] = c;
+    u.nrg[1] = xmajor;
+    u.nrg[2] = sx;
+    u.nrg[3] = sy;
+    u.nbu[0] = cb->r - ca->r;
+    u.nbu[1] = cb->g - ca->g;
+    u.nbu[2] = cb->b - ca->b;
     if (u.kind[1] & F_BACKGROUND) {
-        sync_background(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+        sync_background(x0, y0, w, h);
     }
-    for (i = 0; i < pixels.n; i++) {
-        Record *e;
-        u.a[0] = pixels.px[i][0];
-        u.a[1] = pixels.px[i][1];
-        u.col[0] = pixels.px[i][2];
-        u.col[1] = pixels.px[i][3];
-        u.col[2] = pixels.px[i][4];
-        e = draw_add(&u, 6, pixels.px[i][0], pixels.px[i][1], 1, 1);
-        rect_geometry(e, pixels.px[i][0], pixels.px[i][1], 1, 1);
-    }
-    mark_dirty(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+    e = draw_add(&u, 6, x0, y0, w, h);
+    rect_geometry(e, x0, y0, w, h);
+    mark_dirty(x0, y0, w, h);
 }
 
 /* A rectangle at (x, y) wrapping at the VRAM's edges, as up to four rectangles inside it: each piece's corner and size
@@ -783,6 +802,9 @@ void render_gpu_unit_event(const GpuEvent *ev, int pair_x0) {
         break;
     case GPU_EV_RECT:
         raster_rect(ev);
+        break;
+    case GPU_EV_SEGMENT:
+        raster_segment(ev);
         break;
     default:
         break;

@@ -43,6 +43,7 @@ cbuffer Unit : register(b0, space3) {
 #define OP_FILL 2
 #define OP_COPY 3
 #define OP_LOAD 4
+#define OP_SEGMENT 5
 
 #define F_RAW 1
 #define F_SEMI 2
@@ -234,6 +235,22 @@ float4 main(float4 pos : SV_Position) : SV_Target0 {
             if (hires) {
                 c = clamp(c, cmin.rgb, cmax.rgb);
             }
+        }
+    } else if (op == OP_SEGMENT) {
+        // Exact integer stepping of psyq/gpu.c's gpu_segment_walk: one draw per segment instead of one per pixel.
+        int major = a.z, minor = a.w;
+        int i = nrg.y != 0 ? (p.x - a.x) : (p.y - a.y);
+        if (i < 0 || i > major) {
+            discard;
+        }
+        int off = major == 0 ? 0 : (minor * i + nrg.x) / major;
+        int expected = nrg.y != 0 ? (a.y + nrg.w * off) : (a.x + nrg.z * off);
+        int actual = nrg.y != 0 ? p.y : p.x;
+        if (actual != expected) {
+            discard;
+        }
+        if ((flags & F_GOURAUD) && major != 0) {
+            c = col.rgb + int3(floordiv(nbu.r * i, major), floordiv(nbu.g * i, major), floordiv(nbu.b * i, major));
         }
     } else {
         u = a.z + (p.x - a.x);
