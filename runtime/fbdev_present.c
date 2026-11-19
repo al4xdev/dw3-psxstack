@@ -102,6 +102,14 @@ int Fbdev_Open(FbdevPresent *fb, const char *device, char *why, size_t why_size)
         Fbdev_Close(fb);
         return -1;
     }
+    /* Frames are written at the start of the map. A double-buffered panel (virtual height twice the visible one, as
+     * on the H700 under muOS) may have been left showing its other page by the frontend: put page 0 up, or every
+     * frame lands on a page nobody sees and the screen stays black. */
+    if (var.xoffset != 0 || var.yoffset != 0) {
+        var.xoffset = 0;
+        var.yoffset = 0;
+        (void)ioctl(fb->fd, FBIOPAN_DISPLAY, &var);
+    }
     return 0;
 }
 
