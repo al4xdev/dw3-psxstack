@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1302,11 +1303,26 @@ static int gles_try_init_display(EGLDisplay dpy, int need_pbuffer, EGLint *major
     return 1;
 }
 
+/* 1 when two DRM nodes (by sysfs name, "card0") sit on the same device. */
+static int gles_same_drm_device(const char *a, const char *b) {
+    char pa[64], pb[64], ra[PATH_MAX], rb[PATH_MAX];
+    snprintf(pa, sizeof(pa), "/sys/class/drm/%s/device", a);
+    snprintf(pb, sizeof(pb), "/sys/class/drm/%s/device", b);
+    return realpath(pa, ra) != NULL && realpath(pb, rb) != NULL && strcmp(ra, rb) == 0;
+}
+
 int render_gles_open(char *why, size_t why_size) {
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
     EGLint major = 0, minor = 0;
     const char *version, *renderer;
-    static const char *const dri_nodes[] = {"/dev/dri/renderD128", "/dev/dri/card0", "/dev/dri/card1", NULL};
+    static const char *const split_nodes[] = {"/dev/dri/renderD128", "/dev/dri/card0", "/dev/dri/card1", NULL};
+    static const char *const same_nodes[] = {"/dev/dri/card0", "/dev/dri/renderD128", "/dev/dri/card1", NULL};
+    /* The render node first only where it is a separate GPU from the display (card0 there may be display-only KMS).
+     * Where both are one device, as rockchip-drm on the RK3326, card0 first: Rockchip's libmali calls
+     * drmSetInterfaceVersion on the fd it is given, and their BSP kernel (EmuELEC 5.10) lets that ioctl through on a
+     * render node, which has no master, and oopses on the NULL (drm_setversion -> master->unique). The game dies
+     * holding the DRM lock and the handheld needs a hard reset. */
+    const char *const *dri_nodes = gles_same_drm_device("card0", "renderD128") ? same_nodes : split_nodes;
 
     if (gles_open) {
         return 1;
