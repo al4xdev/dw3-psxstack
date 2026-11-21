@@ -17,8 +17,9 @@ this fork are collected here. The port consumes this repository as a git submodu
   and `/dev/fb0` is readable and writable. If the open fails the run falls back to SDL.
 - **NEON spans in the software rasteriser** (`psyq/gpu.c`) for Gouraud and flat spans; each falls back to scalar when a
   span can read its own row.
-- **An SDL2 build** (`-DPSXSTACK_SDL2=ON`): the handheld firmwares ship SDL2, so the audio queue and the window code
-  have an SDL2 path beside the SDL3 one. The port's `tools/build_arm.sh` shows the full ARM configuration.
+- **An SDL2 build** (`-DPSXSTACK_SDL2=ON`): the handheld firmwares ship SDL2, so the audio queue, the window code and
+  the input have an SDL2 path beside the SDL3 one. The input's pad map is fixed; the hotkeys and the mods' bindings
+  are the SDL3 build's (docs/LAUNCHER.md "Input bindings"), so a game's fast-forward chord comes from its settings. The port's `tools/build_arm.sh` shows the full ARM configuration.
 - **Audio** (`runtime/audio.c`): `port_audio_resync` clears the queued audio when an overlay loads, and the SDL2 queue is
   bounded, so the sound does not drift behind the picture after a long load.
 - **Signals** (`runtime/platform.c`): SIGTERM, SIGINT and SIGHUP end the run at the end of the next vsync, so the log and

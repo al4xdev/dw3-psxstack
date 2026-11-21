@@ -143,6 +143,9 @@ and absolute paths and exits 0, or exits 64 naming the bad key.
   (so nothing reaches the game, the log or the record). The key again resumes, with the pace's schedule started over.
 - With `--script` the script owns the pad: the keyboard and gamepads are read but never sent to the game (the hotkeys
   still act). `--input-test` tests the active map: the defaults without `--config`, the settings' with it.
+- **The SDL2 build** (`PSXSTACK_SDL2`, the handhelds) reads no `keyboard` or `gamepad` map (its own is fixed:
+  `runtime/input.c` `sdl2_map`) and has no `--input-test`, but its hotkeys and the mods' bindings work as above, latch
+  and masking included.
 
 ### Mods section
 

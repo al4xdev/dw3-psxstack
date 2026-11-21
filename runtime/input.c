@@ -2,7 +2,9 @@
  * keyboard and every SDL gamepad, ORed into pad 1 (a digital pad: SELECT, START, the D-pad, L1/L2/R1/R2 and the four
  * face buttons; psyq_pad_set, psyq.h's bit order), once per vsync from pump.c; and the hotkey actions (pause,
  * fullscreen, the mods' bindings). Only in a build configured with -DPSXSTACK_SDL=ON (PSXSTACK_SDL); the headless build
- * has no input but the script's (its actions never fire; the settings' names are checked for their shape only).
+ * has no input but the script's (its actions never fire; the settings' names are checked for their shape only). The
+ * handheld's SDL2 build (PSXSTACK_SDL2) has a fixed pad map of its own (sdl2_map: no `input.keyboard`/`input.gamepad`,
+ * no --input-test) and the same hotkey actions: the bindings, the latch and the masking below are both builds'.
  *
  * Inputs: every keyboard key (an SDL scancode: the key's place, whatever the layout) and the gamepad inputs of
  * input_pad_names (SDL's positional buttons, then the triggers and the stick directions past half way, all gamepads
@@ -45,6 +47,8 @@
 
 #ifdef PSXSTACK_SDL
 #include <SDL3/SDL.h>
+#elif defined(PSXSTACK_SDL2)
+#include <SDL2/SDL.h>
 #endif
 
 /* The PS1 pad's bits (psyq.h psyq_pad_set; active high), by the settings' names. */
@@ -138,10 +142,10 @@ static int input_pad_index(const char *name) {
     return -1;
 }
 
-/* A key name (SDL3's scancode names) -> its input id; -1 when unknown. Without SDL: 0 for any non-empty name (the
- * headless build checks the shape only: it has no keyboard). */
+/* A key name (SDL3's scancode names; SDL2's are the same, and so are its scancodes) -> its input id; -1 when unknown.
+ * Without SDL: 0 for any non-empty name (the headless build checks the shape only: it has no keyboard). */
 static int input_key_id(const char *name) {
-#ifdef PSXSTACK_SDL
+#if defined(PSXSTACK_SDL) || defined(PSXSTACK_SDL2)
     SDL_Scancode sc = SDL_GetScancodeFromName(name);
     return sc != SDL_SCANCODE_UNKNOWN && (int)sc < INPUT_KEYS ? (int)sc : -1;
 #else
@@ -368,13 +372,50 @@ void port_input_settings(const PortJson *input) {
                                                "input.hotkeys.fullscreen", "\"F11\"");
 }
 
+#if defined(PSXSTACK_SDL) || defined(PSXSTACK_SDL2)
+/* Both SDL builds: every input's state and the hotkey actions from it (the SDL2 build fills input_down from its own
+ * reads, below). */
+static u8 input_down[INPUT_IDS];   /* every input, at the last poll */
+static u8 input_masked[INPUT_IDS]; /* inputs of a latched trigger */
+
+/* The actions from the inputs: triggers completed (an action pressed), held, latched; the masked inputs. */
+static void input_actions_update(void) {
+    int a, t, k;
+    memset(input_masked, 0, sizeof(input_masked));
+    for (a = 0; a < input_action_count; a++) {
+        input_actions[a].held = input_actions[a].pressed = 0;
+        for (t = 0; t < input_actions[a].count; t++) {
+            InputTrigger *tr = &input_actions[a].triggers[t];
+            int all = 1, any = 0;
+            for (k = 0; k < tr->n; k++) {
+                all &= input_down[tr->ids[k]];
+                any |= input_down[tr->ids[k]];
+            }
+            if (all && !tr->complete) {
+                input_actions[a].pressed = 1;
+                tr->latched = 1;
+            }
+            tr->complete = all;
+            if (!any) {
+                tr->latched = 0;
+            }
+            input_actions[a].held |= all;
+            if (tr->latched) {
+                for (k = 0; k < tr->n; k++) {
+                    input_masked[tr->ids[k]] = 1;
+                }
+            }
+        }
+    }
+}
+
+#endif
+
 #ifdef PSXSTACK_SDL
 #define INPUT_AXIS_PRESSED 16384 /* half way: a trigger or a stick direction counts as pressed beyond it */
 #define INPUT_MAX_GAMEPADS 8
 
 static u8 input_key_down[INPUT_KEYS];  /* from the key events */
-static u8 input_down[INPUT_IDS];       /* every input, at the last poll */
-static u8 input_masked[INPUT_IDS];     /* inputs of a latched trigger */
 static SDL_Gamepad *input_gamepads[INPUT_MAX_GAMEPADS];
 static u16 input_applied;              /* the buttons last sent to psyq_pad_set */
 static int input_applied_any;          /* psyq_pad_set was called by this file */
@@ -462,37 +503,6 @@ static void input_read(void) {
             /* the triggers and the + directions: above half way; the - directions: below minus half way */
             int on = (j < 2 || (j & 1)) ? v > INPUT_AXIS_PRESSED : v < -INPUT_AXIS_PRESSED;
             input_down[INPUT_PAD(INPUT_PAD_BUTTONS + j)] |= on ? 1 : 0;
-        }
-    }
-}
-
-/* The actions from the inputs: triggers completed (an action pressed), held, latched; the masked inputs. */
-static void input_actions_update(void) {
-    int a, t, k;
-    memset(input_masked, 0, sizeof(input_masked));
-    for (a = 0; a < input_action_count; a++) {
-        input_actions[a].held = input_actions[a].pressed = 0;
-        for (t = 0; t < input_actions[a].count; t++) {
-            InputTrigger *tr = &input_actions[a].triggers[t];
-            int all = 1, any = 0;
-            for (k = 0; k < tr->n; k++) {
-                all &= input_down[tr->ids[k]];
-                any |= input_down[tr->ids[k]];
-            }
-            if (all && !tr->complete) {
-                input_actions[a].pressed = 1;
-                tr->latched = 1;
-            }
-            tr->complete = all;
-            if (!any) {
-                tr->latched = 0;
-            }
-            input_actions[a].held |= all;
-            if (tr->latched) {
-                for (k = 0; k < tr->n; k++) {
-                    input_masked[tr->ids[k]] = 1;
-                }
-            }
         }
     }
 }
@@ -846,8 +856,6 @@ void port_input_poll_paused(void) {
     input_poll();
 }
 #elif defined(PSXSTACK_SDL2)
-#include <SDL2/SDL.h>
-
 #define MAX_SDL2_PADS 4
 static SDL_GameController *input_controllers[MAX_SDL2_PADS];
 static SDL_Joystick *input_joysticks[MAX_SDL2_PADS];
@@ -921,66 +929,79 @@ void port_input_init(int test) {
     }
 }
 
-static u16 input_read_buttons(void) {
-    u16 bits = input_touch_bits;
-    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+/* The SDL2 build's pad: a fixed map (it does not read input.gamepad: docs/HANDHELD.md; the game applies the player's
+ * pad map on top). Keyboard keys are scancodes, the gamepad inputs input_pad_names' (SDL2's buttons are in SDL3's
+ * order); the sticks keep the handheld's thresholds. */
+#define SDL2_STICK 12000
+#define SDL2_TRIGGER 16000
+static const struct {
+    int id;
+    u16 bits;
+} sdl2_map[] = {
+    { SDL_SCANCODE_UP, PAD_UP }, { SDL_SCANCODE_DOWN, PAD_DOWN }, { SDL_SCANCODE_LEFT, PAD_LEFT },
+    { SDL_SCANCODE_RIGHT, PAD_RIGHT }, { SDL_SCANCODE_X, PAD_CROSS }, { SDL_SCANCODE_C, PAD_CIRCLE },
+    { SDL_SCANCODE_Z, PAD_SQUARE }, { SDL_SCANCODE_S, PAD_TRIANGLE }, { SDL_SCANCODE_RETURN, PAD_START },
+    { SDL_SCANCODE_RSHIFT, PAD_SELECT }, { SDL_SCANCODE_Q, PAD_L1 }, { SDL_SCANCODE_W, PAD_R1 },
+    { SDL_SCANCODE_1, PAD_L2 }, { SDL_SCANCODE_2, PAD_R2 },
+    { INPUT_PAD(SDL_CONTROLLER_BUTTON_DPAD_UP), PAD_UP }, { INPUT_PAD(SDL_CONTROLLER_BUTTON_DPAD_DOWN), PAD_DOWN },
+    { INPUT_PAD(SDL_CONTROLLER_BUTTON_DPAD_LEFT), PAD_LEFT }, { INPUT_PAD(SDL_CONTROLLER_BUTTON_DPAD_RIGHT), PAD_RIGHT },
+    { INPUT_PAD(PAD_LX_NEG), PAD_LEFT }, { INPUT_PAD(PAD_LX_POS), PAD_RIGHT }, { INPUT_PAD(PAD_LY_NEG), PAD_UP },
+    { INPUT_PAD(PAD_LY_POS), PAD_DOWN },
+    { INPUT_PAD(SDL_CONTROLLER_BUTTON_A), PAD_CROSS }, { INPUT_PAD(SDL_CONTROLLER_BUTTON_B), PAD_CIRCLE },
+    { INPUT_PAD(SDL_CONTROLLER_BUTTON_X), PAD_SQUARE }, { INPUT_PAD(SDL_CONTROLLER_BUTTON_Y), PAD_TRIANGLE },
+    { INPUT_PAD(SDL_CONTROLLER_BUTTON_BACK), PAD_SELECT }, { INPUT_PAD(SDL_CONTROLLER_BUTTON_START), PAD_START },
+    { INPUT_PAD(SDL_CONTROLLER_BUTTON_LEFTSHOULDER), PAD_L1 }, { INPUT_PAD(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER), PAD_R1 },
+    { INPUT_PAD(PAD_LT), PAD_L2 }, { INPUT_PAD(PAD_RT), PAD_R2 },
+};
 
-    if (keys != NULL) {
-        if (keys[SDL_SCANCODE_UP]) bits |= PAD_UP;
-        if (keys[SDL_SCANCODE_DOWN]) bits |= PAD_DOWN;
-        if (keys[SDL_SCANCODE_LEFT]) bits |= PAD_LEFT;
-        if (keys[SDL_SCANCODE_RIGHT]) bits |= PAD_RIGHT;
-        if (keys[SDL_SCANCODE_X]) bits |= PAD_CROSS;
-        if (keys[SDL_SCANCODE_C]) bits |= PAD_CIRCLE;
-        if (keys[SDL_SCANCODE_Z]) bits |= PAD_SQUARE;
-        if (keys[SDL_SCANCODE_S]) bits |= PAD_TRIANGLE;
-        if (keys[SDL_SCANCODE_RETURN]) bits |= PAD_START;
-        if (keys[SDL_SCANCODE_RSHIFT]) bits |= PAD_SELECT;
-        if (keys[SDL_SCANCODE_Q]) bits |= PAD_L1;
-        if (keys[SDL_SCANCODE_W]) bits |= PAD_R1;
-        if (keys[SDL_SCANCODE_1]) bits |= PAD_L2;
-        if (keys[SDL_SCANCODE_2]) bits |= PAD_R2;
+/* Every input's state (the keyboard, every game controller ORed), then the hotkey actions: the mods' bindings work
+ * here as in the SDL3 build. Select + Start on one controller quits. */
+static void sdl2_read(void) {
+    static const SDL_GameControllerAxis axes[] = { SDL_CONTROLLER_AXIS_TRIGGERLEFT, SDL_CONTROLLER_AXIS_TRIGGERRIGHT,
+                                                   SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTX,
+                                                   SDL_CONTROLLER_AXIS_LEFTY, SDL_CONTROLLER_AXIS_LEFTY,
+                                                   SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTX,
+                                                   SDL_CONTROLLER_AXIS_RIGHTY, SDL_CONTROLLER_AXIS_RIGHTY };
+    int numkeys = 0, i, j;
+    const Uint8 *keys = SDL_GetKeyboardState(&numkeys);
+    memset(input_down, 0, sizeof(input_down));
+    for (i = 0; keys != NULL && i < numkeys && i < INPUT_KEYS; i++) {
+        input_down[i] = keys[i] ? 1 : 0;
     }
-
-    int any_l3_r3 = 0;
-    for (int i = 0; i < MAX_SDL2_PADS; i++) {
+    for (i = 0; i < MAX_SDL2_PADS; i++) {
         SDL_GameController *gc = input_controllers[i];
-        if (gc != NULL) {
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP)) bits |= PAD_UP;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) bits |= PAD_DOWN;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) bits |= PAD_LEFT;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) bits |= PAD_RIGHT;
-
-            Sint16 lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
-            Sint16 ly = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
-            if (lx < -12000) bits |= PAD_LEFT;
-            if (lx > 12000) bits |= PAD_RIGHT;
-            if (ly < -12000) bits |= PAD_UP;
-            if (ly > 12000) bits |= PAD_DOWN;
-
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A)) bits |= PAD_CROSS;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B)) bits |= PAD_CIRCLE;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X)) bits |= PAD_SQUARE;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y)) bits |= PAD_TRIANGLE;
-
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK)) bits |= PAD_SELECT;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START)) bits |= PAD_START;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) bits |= PAD_L1;
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) bits |= PAD_R1;
-
-            if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000) bits |= PAD_L2;
-            if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000) bits |= PAD_R2;
-
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK) &&
-                SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START)) {
-                port_exit(0, "Quit hotkey Select+Start pressed");
-            }
-            if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
-                SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) {
-                any_l3_r3 = 1;
-            }
+        if (gc == NULL) {
             continue;
         }
+        for (j = 0; j < INPUT_PAD_BUTTONS && j < SDL_CONTROLLER_BUTTON_MAX; j++) {
+            input_down[INPUT_PAD(j)] |= SDL_GameControllerGetButton(gc, (SDL_GameControllerButton)j) ? 1 : 0;
+        }
+        for (j = 0; j < INPUT_PAD_INPUTS - INPUT_PAD_BUTTONS; j++) {
+            Sint16 v = SDL_GameControllerGetAxis(gc, axes[j]);
+            /* the triggers and the + directions: above the threshold; the - directions: below minus it */
+            int lim = j < 2 ? SDL2_TRIGGER : SDL2_STICK;
+            int on = (j < 2 || (j & 1)) ? v > lim : v < -lim;
+            input_down[INPUT_PAD(INPUT_PAD_BUTTONS + j)] |= on ? 1 : 0;
+        }
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK) &&
+            SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START)) {
+            port_exit(0, "Quit hotkey Select+Start pressed");
+        }
+    }
+    input_actions_update();
+}
+
+/* The pad from the map, without a latched hotkey's inputs; the raw joysticks (no game controller mapping) are read
+ * directly and take no part in the hotkeys. */
+static u16 input_read_buttons(void) {
+    u16 bits = input_touch_bits;
+    size_t m;
+    for (m = 0; m < sizeof(sdl2_map) / sizeof(sdl2_map[0]); m++) {
+        if (input_down[sdl2_map[m].id] && !input_masked[sdl2_map[m].id]) {
+            bits |= sdl2_map[m].bits;
+        }
+    }
+    for (int i = 0; i < MAX_SDL2_PADS; i++) {
         SDL_Joystick *js = input_joysticks[i];
         if (js != NULL) {
             Uint8 hat = SDL_JoystickGetHat(js, 0);
@@ -1003,19 +1024,6 @@ static u16 input_read_buttons(void) {
             if (SDL_JoystickGetButton(js, 6)) bits |= PAD_SELECT;
             if (SDL_JoystickGetButton(js, 7)) bits |= PAD_START;
         }
-    }
-
-    static int l3_r3_was_down;
-    if (any_l3_r3) {
-        if (!l3_r3_was_down) {
-            l3_r3_was_down = 1;
-            static int ff_active = 0;
-            ff_active = !ff_active;
-            port_fast_forward_request(ff_active);
-            port_log("handheld: hotkey L3+R3: fast-forward %s", ff_active ? "ON" : "OFF");
-        }
-    } else {
-        l3_r3_was_down = 0;
     }
     return bits;
 }
@@ -1047,6 +1055,7 @@ static void input_poll(void) {
             break;
         }
     }
+    sdl2_read();
 }
 
 void port_input_frame(void) {
