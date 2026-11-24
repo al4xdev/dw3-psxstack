@@ -23,8 +23,9 @@
  * (port_video_gpu_headless), and skips the shot with a log line when there is none.
  * Widescreen (render_gpu_wide.c): a game mod calls port_video_widescreen_enable before the window opens (with the GPU
  * renderer chosen, a new window opens 16:9) and port_video_widescreen(on) every vsync; while it is on, a 15-bit display
- * that has a wide canvas is presented 16:9 inside the window (the window's size is kept: the picture switches between
- * 4:3 and 16:9 in it), and `--gpu-screenshot` and the debug channel's GPU screenshot give the wide image. The
+ * that has a wide canvas is presented at the window's aspect, from 4:3 to 16:9 (video_wide_follow: a 16:10 screen
+ * gets a 16:10 picture; the window's size is kept: the picture switches between 4:3 and the wide one in it; 16:9
+ * without a window), and `--gpu-screenshot` and the debug channel's GPU screenshot give the wide image. The
  * software renderer, `--screenshot` and the frame hash stay 4:3 (logged once while it is asked for).
  * `<PREFIX>_PORT_PRESENT_READBACK=FRAME:PATH` reads SDL_Renderer's output of vsync FRAME back into a PPM (the comparison
  * of the two present paths: tests/port/render_gpu.py); `<PREFIX>_PORT_GPU_VRAM_CHECK=N` compares the rasteriser's whole
@@ -311,7 +312,8 @@ static int video_touch_w, video_touch_h;
 static Uint64 video_start_ns;
 static long video_presents;
 static int video_gpu; /* the window presents through the hardware renderer */
-static int video_aspect[2] = { 4, 3 }; /* the presented picture's aspect: 4:3, or 16:9 at the display's pixel aspect */
+static int video_aspect[2] = { 4, 3 }; /* the presented picture's aspect: 4:3, or the wide canvas's (4 W : 3 w) */
+static int video_wide_aspect[2] = { 16, 9 }; /* what the window asks the wide canvas for: its aspect, 4:3 to 16:9 (video_wide_follow) */
 
 __attribute__((weak)) int port_touch_draw_rgba(u32 *rgba, int w, int h, const int game_rect[4]) {
     (void)rgba;
@@ -455,13 +457,44 @@ static void video_readback(void) {
     SDL_DestroySurface(shot);
 }
 
-/* The width the hardware renderer shows the converted display with: its wide canvas's while widescreen is on (and
- * video_aspect 16:9 at the display's pixel aspect), else the display's (4:3). */
+/* The width the hardware renderer shows the converted display with: its wide canvas's while widescreen is on, else
+ * the display's (4:3). A wide picture's video_aspect is its canvas's own aspect (4 W : 3 w); render_gpu_wide.c makes
+ * the canvas at video_wide_aspect's (the window's) and rounds its columns down. */
 static int video_gpu_width(void) {
     int w = video_vram ? render_gpu_wide_width(video_vram_xy, video_w, video_h) : 0;
     video_aspect[0] = w > 0 ? 4 * w : 4;
     video_aspect[1] = w > 0 ? 3 * video_w : 3;
     return w > 0 ? w : video_w;
+}
+
+/* A wide picture's aspect, the window's (in pixels: what video_dest gets) from 4:3 to 16:9, the widest the games'
+ * wide scenes were checked at (a wider window shows the 16:9 picture with bars at the sides, a narrower one 4:3);
+ * 16:9 without a window. render_gpu_wide.c makes the canvas for it; a change starts the canvases over. */
+static void video_wide_follow(void) {
+    int w, h, a, b;
+    if (video_window == NULL || !SDL_GetWindowSizeInPixels(video_window, &w, &h) || w <= 0 || h <= 0) {
+        return;
+    }
+    if (w * 9 > h * 16 || (h * 16 + 4) / 9 - w <= 1) { /* within a pixel of 16:9: the window opened 16:9 */
+        w = 16;
+        h = 9;
+    } else if (w * 3 < h * 4) {
+        w = 4;
+        h = 3;
+    }
+    for (a = w, b = h; b != 0;) { /* the aspect in lowest terms: 1280x800 is 16:10 */
+        int r = a % b;
+        a = b;
+        b = r;
+    }
+    w /= a;
+    h /= a;
+    if (w != video_wide_aspect[0] || h != video_wide_aspect[1]) {
+        port_log("widescreen: %d:%d, the window's", w, h);
+    }
+    video_wide_aspect[0] = w;
+    video_wide_aspect[1] = h;
+    render_gpu_wide_set_aspect(w, h);
 }
 
 static void video_present(void) {
@@ -1007,6 +1040,9 @@ void port_video_widescreen_enable(void) {
 void port_video_widescreen(int on) {
 #ifdef PSXSTACK_SDL
     int gpu = render_gpu_rasterising();
+    if (on) {
+        video_wide_follow();
+    }
     render_gpu_wide_set(on);
 #else
     int gpu = 0;

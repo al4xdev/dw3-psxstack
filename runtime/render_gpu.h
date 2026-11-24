@@ -63,6 +63,7 @@ void render_gpu_set_filter(const PortFilter *f);
  * display stays 4:3). */
 void render_gpu_wide_enable(void);
 void render_gpu_wide_set(int on);
+void render_gpu_wide_set_aspect(int a, int b);
 int render_gpu_wide_width(const int vram_xy[2], int w, int h);
 int render_gpu_wide_pad(void);
 /* Releases everything, the window's claim, then the device (before SDL_Quit: video.c port_video_quit). */

@@ -6,9 +6,12 @@
  * for a wider picture (textures sit beside the display buffers), so the rasteriser keeps a canvas per display buffer
  * in a strip of its target right of the VRAM (render_gpu_wide.h; the target is 1024 + 512 VRAM pixels wide while
  * widescreen is enabled) and draws every unit it draws into a display buffer a second time there:
- *  - translated by (dx, dy), so that the buffer's left edge lands P pixels into the canvas: P = ceil(w / 6), which
- *    makes the canvas w + 2P wide, 16:9 at the 4:3 display's pixel aspect (320 -> 428). dx and dy keep the 4x4
- *    dither's phase; the canvas's rows are a 256-line slot, so two buffers share the strip;
+ *  - translated by (dx, dy), so that the buffer's left edge lands P pixels into the canvas: P makes the canvas
+ *    w + 2P wide, the aspect a:b video.c asks for (render_gpu_wide_set_aspect: the window's, 4:3 to 16:9) at the 4:3
+ *    display's pixel aspect, rounded down so that the canvas is never wider than a:b (a whole multiple of it fits a
+ *    screen of that aspect): P = floor(w (3a - 4b) / 8b), 53 at 16:9 (320 -> 426), 32 at 16:10 (320 -> 384), 0 at
+ *    4:3 (no wide picture). dx and dy keep the 4x4 dither's phase; the canvas's rows are a 256-line slot, so two
+ *    buffers share the strip;
  *  - with the drawing area widened by P on each side where it reaches the buffer's edge (the layers that draw the
  *    whole screen); an area inside the buffer (a window's clip) keeps its size;
  *  - an untextured triangle whose vertices all lie on the buffer's left and right edges, or an untextured rectangle
@@ -53,6 +56,7 @@ static struct {
     int on;      /* the scenes that widen: port_video_widescreen */
     int w, h;    /* the display's size the slots are for */
     int pad;     /* P: the columns added on each side */
+    int aspect[2]; /* the canvas's aspect, a:b (render_gpu_wide_set_aspect; 0:0 until then: 16:9) */
     unsigned long vsync;
     WideSlot slot[WIDE_SLOTS];
 } wide;
@@ -63,6 +67,11 @@ void render_gpu_wide_enable(void) {
 
 int render_gpu_wide_enabled(void) {
     return wide.enabled;
+}
+
+void render_gpu_wide_set_aspect(int a, int b) {
+    wide.aspect[0] = a;
+    wide.aspect[1] = b;
 }
 
 /* The slot of the display buffer at (x, y), or NULL. */
@@ -127,18 +136,18 @@ static WideSlot *wide_add(int x, int y) {
     return s;
 }
 
-/* The display's size: the slots start over when it changes; 0 when it cannot be shown wide. */
+/* The display's size: the slots start over when it or the aspect's P changes; 0 when it cannot be shown wide. */
 static int wide_display(PsyqDisplay *d) {
-    int pad;
+    int pad, a = wide.aspect[0] > 0 ? wide.aspect[0] : 16, b = wide.aspect[0] > 0 ? wide.aspect[1] : 9;
     psyq_gpu_display(d);
     if (!d->enabled || d->rgb24 || d->w <= 0 || d->h <= 0) {
         return 0;
     }
-    pad = (d->w + 5) / 6;
-    if (d->w + 2 * pad + 3 > RENDER_WIDE_COLS || d->h > WIDE_SLOT_H) {
+    pad = d->w * (3 * a - 4 * b) / (8 * b);
+    if (pad <= 0 || d->w + 2 * pad + 3 > RENDER_WIDE_COLS || d->h > WIDE_SLOT_H) {
         return 0;
     }
-    if (d->w != wide.w || d->h != wide.h) {
+    if (d->w != wide.w || d->h != wide.h || pad != wide.pad) {
         memset(wide.slot, 0, sizeof(wide.slot));
         wide.w = d->w;
         wide.h = d->h;
