@@ -383,6 +383,9 @@ void port_audio_frame(void) {
 void port_audio_resync(void) {
 #ifdef PSXSTACK_SDL
     if (audio_stream != NULL) {
+        if (SDL_GetAudioStreamQueued(audio_stream) <= (int)(audio_target * 2.0) * 4) {
+            return;
+        }
         SDL_ClearAudioStream(audio_stream);
         audio_started = 0;
         audio_avg = audio_target;

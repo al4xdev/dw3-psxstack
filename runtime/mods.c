@@ -315,17 +315,19 @@ static void mods_status(void) {
 /* Fast-forward on or off: the mod's bindings, or skip_dialogues' request (with fast_forward's speed and mute). */
 static void ff_apply(void) {
     const PortMod *f = &ff_mod;
-    int on = (f->enabled && ff.wanted) || ff.requested;
-    int mult = ff_multiples[(int)f->values[FF_SPEED].number];
-    if (on == ff.active) {
+    int wanted = f->enabled && ff.wanted;
+    int on = wanted || ff.requested != 0;
+    int mult = ff.requested >= 2 ? 0 : ff_multiples[(int)f->values[FF_SPEED].number];
+    long target = on ? (mult > 0 ? port_rate * mult : 0) : ff.base_pace;
+    if (on == ff.active && (!on || port_pace_get() == target)) {
         return;
     }
     ff.active = on;
-    port_pace_set(on ? (mult > 0 ? port_rate * mult : 0) : ff.base_pace);
+    port_pace_set(target);
     port_video_set_present_cap(on ? 60 : 0);
-    port_audio_set_mute(on && f->values[FF_MUTE].number != 0);
+    port_audio_set_mute(on && (wanted || ff.requested < 2) && f->values[FF_MUTE].number != 0);
     port_log("fast-forward: %s at frame %ld, %.3f s (pace %ld)%s", on ? "on" : "off", port_frames, ff_seconds(),
-             port_pace_get(), ff.requested && !(f->enabled && ff.wanted) ? " (a cutscene's waits)" : "");
+             port_pace_get(), ff.requested && !wanted ? " (a cutscene's waits)" : "");
 }
 
 void port_mods_frame(void) {
