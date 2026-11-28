@@ -90,6 +90,15 @@ static PortFilter video_filter;         /* --filter / video.filter: the hardware
 #ifdef PSXSTACK_SDL
 static int video_fill;                  /* --fill / video.fill: fill output preserving aspect (0: integer scale) */
 #endif
+static int video_fmv_autocrop;
+static int video_crop_active;
+static int video_crop_aspect[2] = { 4, 3 };
+static struct {
+    int has;
+    int src_w, src_h;
+    int x0, y0, x1, y1;
+    int shrink_streak;
+} fmv_crop;
 static struct {
     long frame;
     int w, h; /* the output's size; 0: the image's own */
@@ -123,6 +132,123 @@ static u32 video_byte(const u16 *row, int x) {
  * the renderer's own target: the shim's array holds only the transfers, so a screenshot - or the debug channel's - of it
  * would come out without the drawn scene. The 24-bit display is a byte view of the VRAM that the RGBA8 target cannot
  * hold, and it is made of transfers (the movie), so it stays read from the array either way. */
+static void video_fmv_apply_crop(int w, int h) {
+    int x, y, top = h, bot = -1, left = w, right = -1;
+    int x0, y0, x1, y1, cw, ch, a, b;
+
+    if (fmv_crop.src_w != w || fmv_crop.src_h != h) {
+        memset(&fmv_crop, 0, sizeof(fmv_crop));
+        fmv_crop.src_w = w;
+        fmv_crop.src_h = h;
+    }
+    for (y = 0; y < h; y++) {
+        const u32 *row = video_pixels + (size_t)y * w;
+        for (x = 0; x < w; x++) {
+            u32 p = row[x];
+            if (((p >> 16) & 0xFF) > 12 || ((p >> 8) & 0xFF) > 12 || (p & 0xFF) > 12) {
+                if (y < top) {
+                    top = y;
+                }
+                if (y > bot) {
+                    bot = y;
+                }
+                if (x < left) {
+                    left = x;
+                }
+                if (x > right) {
+                    right = x;
+                }
+            }
+        }
+    }
+    if (top <= bot && left <= right) {
+        top &= ~1;
+        bot |= 1;
+        if (bot >= h) {
+            bot = h - 1;
+        }
+        left &= ~1;
+        right |= 1;
+        if (right >= w) {
+            right = w - 1;
+        }
+        if (bot - top + 1 < h / 2) {
+            int mid = (top + bot) / 2;
+            top = (mid - h / 4) & ~1;
+            if (top < 0) {
+                top = 0;
+            }
+            bot = top + (h / 2) - 1;
+            if (bot >= h) {
+                bot = h - 1;
+            }
+        }
+        if (right - left + 1 < w / 2) {
+            left = 0;
+            right = w - 1;
+        }
+        if (!fmv_crop.has) {
+            fmv_crop.x0 = left;
+            fmv_crop.y0 = top;
+            fmv_crop.x1 = right;
+            fmv_crop.y1 = bot;
+            fmv_crop.has = 1;
+            fmv_crop.shrink_streak = 0;
+        } else if (left < fmv_crop.x0 || top < fmv_crop.y0 || right > fmv_crop.x1 || bot > fmv_crop.y1) {
+            if (left < fmv_crop.x0) {
+                fmv_crop.x0 = left;
+            }
+            if (top < fmv_crop.y0) {
+                fmv_crop.y0 = top;
+            }
+            if (right > fmv_crop.x1) {
+                fmv_crop.x1 = right;
+            }
+            if (bot > fmv_crop.y1) {
+                fmv_crop.y1 = bot;
+            }
+            fmv_crop.shrink_streak = 0;
+        } else if (left > fmv_crop.x0 || top > fmv_crop.y0 || right < fmv_crop.x1 || bot < fmv_crop.y1) {
+            if (++fmv_crop.shrink_streak >= 18) {
+                fmv_crop.x0 = left;
+                fmv_crop.y0 = top;
+                fmv_crop.x1 = right;
+                fmv_crop.y1 = bot;
+                fmv_crop.shrink_streak = 0;
+            }
+        } else {
+            fmv_crop.shrink_streak = 0;
+        }
+    }
+    if (!fmv_crop.has) {
+        return;
+    }
+    x0 = fmv_crop.x0;
+    y0 = fmv_crop.y0;
+    x1 = fmv_crop.x1;
+    y1 = fmv_crop.y1;
+    cw = x1 - x0 + 1;
+    ch = y1 - y0 + 1;
+    if (cw == w && ch == h) {
+        return;
+    }
+    for (y = 0; y < ch; y++) {
+        memmove(video_pixels + (size_t)y * cw, video_pixels + (size_t)(y0 + y) * w + x0, (size_t)cw * sizeof(u32));
+    }
+    video_w = cw;
+    video_h = ch;
+    a = 4 * cw * h;
+    b = 3 * w * ch;
+    while (b != 0) {
+        int r = a % b;
+        a = b;
+        b = r;
+    }
+    video_crop_aspect[0] = (4 * cw * h) / a;
+    video_crop_aspect[1] = (3 * w * ch) / a;
+    video_crop_active = 1;
+}
+
 static void video_convert(void) {
     PsyqDisplay d;
     const u16 *vram = psyq_gpu_vram();
@@ -139,6 +265,10 @@ static void video_convert(void) {
     h = h < VIDEO_MAX_H ? h : VIDEO_MAX_H;
     video_w = w;
     video_h = h;
+    video_crop_active = 0;
+    if (!d.rgb24) {
+        fmv_crop.has = 0;
+    }
     video_converted_frame = port_frames;
     video_vram = d.enabled && d.w > 0 && d.h > 0 && !d.rgb24;
     video_vram_xy[0] = d.x;
@@ -184,6 +314,9 @@ static void video_convert(void) {
                 out[x] = video_rgb15(row[(d.x + x) & 1023]);
             }
         }
+    }
+    if (video_fmv_autocrop && d.rgb24) {
+        video_fmv_apply_crop(w, h);
     }
 }
 
@@ -256,6 +389,14 @@ void port_video_set_fill(int fill) {
 #else
     (void)fill;
 #endif
+}
+
+void port_video_set_fmv_autocrop(int on) {
+    video_fmv_autocrop = on != 0;
+    if (!video_fmv_autocrop) {
+        fmv_crop.has = 0;
+        video_crop_active = 0;
+    }
 }
 
 int port_video_gpu_screenshot_add(const char *spec) {
@@ -462,8 +603,16 @@ static void video_readback(void) {
  * the canvas at video_wide_aspect's (the window's) and rounds its columns down. */
 static int video_gpu_width(void) {
     int w = video_vram ? render_gpu_wide_width(video_vram_xy, video_w, video_h) : 0;
-    video_aspect[0] = w > 0 ? 4 * w : 4;
-    video_aspect[1] = w > 0 ? 3 * video_w : 3;
+    if (w > 0) {
+        video_aspect[0] = 4 * w;
+        video_aspect[1] = 3 * video_w;
+    } else if (video_crop_active) {
+        video_aspect[0] = video_crop_aspect[0];
+        video_aspect[1] = video_crop_aspect[1];
+    } else {
+        video_aspect[0] = 4;
+        video_aspect[1] = 3;
+    }
     return w > 0 ? w : video_w;
 }
 
@@ -507,8 +656,13 @@ static void video_present(void) {
         }
         return;
     }
-    video_aspect[0] = 4; /* the software renderer: always 4:3 */
-    video_aspect[1] = 3;
+    if (video_crop_active) {
+        video_aspect[0] = video_crop_aspect[0];
+        video_aspect[1] = video_crop_aspect[1];
+    } else {
+        video_aspect[0] = 4; /* the software renderer: always 4:3 */
+        video_aspect[1] = 3;
+    }
     if (video_texture == NULL || video_tex_w != video_w || video_tex_h != video_h) {
         if (video_texture != NULL) {
             SDL_DestroyTexture(video_texture);

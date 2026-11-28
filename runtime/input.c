@@ -417,6 +417,7 @@ static void input_actions_update(void) {
 
 static u8 input_key_down[INPUT_KEYS];  /* from the key events */
 static SDL_Gamepad *input_gamepads[INPUT_MAX_GAMEPADS];
+static u16 input_pad_axis_latched[INPUT_MAX_GAMEPADS];
 static u16 input_applied;              /* the buttons last sent to psyq_pad_set */
 static int input_applied_any;          /* psyq_pad_set was called by this file */
 static u16 input_touch_bits;           /* currently held virtual touch buttons */
@@ -447,12 +448,26 @@ static struct {
 } input_test_steps[TEST_MAX_STEPS];
 static int input_test_count, input_test_keys, input_test_pads, input_test_hotkeys;
 
+static const SDL_GamepadAxis input_pad_axes[] = { SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
+                                                  SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTX,
+                                                  SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_LEFTY,
+                                                  SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTX,
+                                                  SDL_GAMEPAD_AXIS_RIGHTY, SDL_GAMEPAD_AXIS_RIGHTY };
+
 static void input_gamepad_added(SDL_JoystickID id) {
-    int i;
+    int i, j;
     for (i = 0; i < INPUT_MAX_GAMEPADS; i++) {
         if (input_gamepads[i] == NULL) {
             input_gamepads[i] = SDL_OpenGamepad(id);
+            input_pad_axis_latched[i] = 0;
             if (input_gamepads[i] != NULL) {
+                for (j = 0; j < INPUT_PAD_INPUTS - INPUT_PAD_BUTTONS; j++) {
+                    Sint16 v = SDL_GetGamepadAxis(input_gamepads[i], input_pad_axes[j]);
+                    int on = (j < 2 || (j & 1)) ? v > INPUT_AXIS_PRESSED : v < -INPUT_AXIS_PRESSED;
+                    if (on) {
+                        input_pad_axis_latched[i] |= (u16)(1u << j);
+                    }
+                }
                 port_log("input: gamepad %s", SDL_GetGamepadName(input_gamepads[i]));
             }
             return;
@@ -466,6 +481,7 @@ static void input_gamepad_removed(SDL_JoystickID id) {
         if (input_gamepads[i] != NULL && SDL_GetGamepadID(input_gamepads[i]) == id) {
             SDL_CloseGamepad(input_gamepads[i]);
             input_gamepads[i] = NULL;
+            input_pad_axis_latched[i] = 0;
         }
     }
 }
@@ -482,11 +498,6 @@ static int input_gamepad_open(SDL_JoystickID id) {
 
 /* Every input's state: the keys from their events, the gamepads read now (all of them ORed). */
 static void input_read(void) {
-    static const SDL_GamepadAxis axes[] = { SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
-                                            SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTX,
-                                            SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_LEFTY,
-                                            SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTX,
-                                            SDL_GAMEPAD_AXIS_RIGHTY, SDL_GAMEPAD_AXIS_RIGHTY };
     int i, j;
     memcpy(input_down, input_key_down, INPUT_KEYS);
     memset(input_down + INPUT_KEYS, 0, INPUT_PAD_INPUTS);
@@ -499,9 +510,16 @@ static void input_read(void) {
             input_down[INPUT_PAD(j)] |= SDL_GetGamepadButton(g, (SDL_GamepadButton)j) ? 1 : 0;
         }
         for (j = 0; j < INPUT_PAD_INPUTS - INPUT_PAD_BUTTONS; j++) {
-            Sint16 v = SDL_GetGamepadAxis(g, axes[j]);
+            Sint16 v = SDL_GetGamepadAxis(g, input_pad_axes[j]);
             /* the triggers and the + directions: above half way; the - directions: below minus half way */
             int on = (j < 2 || (j & 1)) ? v > INPUT_AXIS_PRESSED : v < -INPUT_AXIS_PRESSED;
+            if (input_pad_axis_latched[i] & (u16)(1u << j)) {
+                if (!on) {
+                    input_pad_axis_latched[i] &= (u16)~(1u << j);
+                } else {
+                    on = 0;
+                }
+            }
             input_down[INPUT_PAD(INPUT_PAD_BUTTONS + j)] |= on ? 1 : 0;
         }
     }

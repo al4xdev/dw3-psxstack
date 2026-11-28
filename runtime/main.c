@@ -309,6 +309,7 @@ int main(int argc, char **argv) {
     const char *renderer = "software";
     int subpixel = 1;
     int fill = 0;
+    int fmv_autocrop = 0;
     const char *config = NULL;
     PortFilter filter = PORT_FILTER_DEFAULTS;
     int print_settings = 0, print_mods = 0, script_mods = 0;
@@ -336,6 +337,7 @@ int main(int argc, char **argv) {
         scale = port_settings.scale;
         fullscreen = port_settings.fullscreen;
         fill = port_settings.fill;
+        fmv_autocrop = port_settings.fmv_autocrop;
         /* The renderer the file asks for, as the default --renderer overrides below. It used to be read into `gpu`
          * alone, which only --print-settings ever looked at: a file saying "gpu" ran software. */
         renderer = port_settings.gles ? "gles" : port_settings.gpu ? "gpu" : "software";
@@ -474,6 +476,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--fill") == 0) {
             fill = 1;
+        } else if (strcmp(argv[i], "--fmv-autocrop") == 0) {
+            fmv_autocrop = 1;
         } else if (strcmp(argv[i], "--gpu-screenshot") == 0 && i + 1 < argc) {
             if (!port_video_gpu_screenshot_add(argv[++i])) {
                 fprintf(stderr, "port: --gpu-screenshot: FRAME[@WxH]:PATH (FRAME >= 1; at most 64): %s\n", argv[i]);
@@ -552,6 +556,7 @@ int main(int argc, char **argv) {
         eff.scale = scale;
         eff.fullscreen = fullscreen;
         eff.fill = fill;
+        eff.fmv_autocrop = fmv_autocrop;
         eff.mute = mute;
         eff.watchdog = port_watchdog_sec;
         eff.refresh = refresh;
@@ -585,6 +590,7 @@ int main(int argc, char **argv) {
     port_video_set_subpixel(subpixel);
     port_video_set_filter(&filter);
     port_video_set_fill(fill);
+    port_video_set_fmv_autocrop(fmv_autocrop);
     if (window && !port_video_available()) {
         fprintf(stderr, "port: --window: this build has no window: configure with -DPSXSTACK_SDL=ON "
                         "(port/README.md \"The window\")\n");

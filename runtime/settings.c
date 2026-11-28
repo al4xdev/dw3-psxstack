@@ -144,7 +144,7 @@ void port_settings_load(const char *path) {
     static const char *const top_keys[] = { "schema", "disc", "video", "audio", "memcard1", "memcard2", "watchdog",
                                             "input", "mods", "mod_order", "launcher", "debug", NULL };
     static const char *const disc_keys[] = { "path", "sha1", NULL };
-    static const char *const video_keys[] = { "window", "scale", "fullscreen", "fill", "refresh", "renderer",
+    static const char *const video_keys[] = { "window", "scale", "fullscreen", "fill", "fmv_autocrop", "refresh", "renderer",
                                               "internal_scale", "subpixel", "filter", "crt", NULL };
     static const char *const audio_keys[] = { "mute", NULL };
     static const char *const crt_keys[] = { "scanlines", "mask", "curvature", NULL };
@@ -216,6 +216,7 @@ void port_settings_load(const char *path) {
         settings_int(obj, "video", "scale", 1, 16, &s->scale);
         settings_bool(obj, "video", "fullscreen", &s->fullscreen);
         settings_bool(obj, "video", "fill", &s->fill);
+        settings_bool(obj, "video", "fmv_autocrop", &s->fmv_autocrop);
         settings_int(obj, "video", "refresh", 50, 60, &s->refresh);
         if (s->refresh != 50 && s->refresh != 60) {
             port_settings_fail("video.refresh", "50 (PAL) or 60, not %d", s->refresh);
@@ -297,6 +298,9 @@ void port_settings_print(FILE *f, const PortSettings *s) {
             s->gles ? "gles" : s->gpu ? "gpu" : "software", s->internal_scale);
     if (s->fill) {
         fputs(",\n    \"fill\": true", f);
+    }
+    if (s->fmv_autocrop) {
+        fputs(",\n    \"fmv_autocrop\": true", f);
     }
     fprintf(f, ",\n    \"subpixel\": \"%s\"", s->subpixel == 2 ? "perspective" : s->subpixel ? "on" : "off");
     fprintf(f, ",\n    \"filter\": \"%s\"", port_filter_names[s->filter]);
